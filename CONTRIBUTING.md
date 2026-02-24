@@ -7,8 +7,8 @@ Thank you for your interest in contributing! This document will help you get sta
 1. **Fork the repository** on GitHub
 2. **Clone your fork**:
    ```bash
-   git clone https://github.com/yourusername/win_event_engine.git
-   cd win_event_engine
+   git clone https://github.com/stylebending/wineventengine.git
+   cd wineventengine
    ```
 3. **Install prerequisites**:
    - [Rust](https://rustup.rs/) (latest stable)

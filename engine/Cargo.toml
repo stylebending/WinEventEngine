@@ -1,10 +1,10 @@
 [package]
-name = "engine"
+name = "WinEventEngine"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "engine"
+name = "WinEventEngine"
 path = "src/main.rs"
 
 [dependencies]

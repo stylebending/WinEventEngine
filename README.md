@@ -2,16 +2,16 @@
 
 <p align="center">
 
-<a href="https://github.com/stylebending/win_event_engine/releases">
-  <img src="https://img.shields.io/github/v/release/stylebending/win_event_engine?style=for-the-badge&color=darkgreen&logo=git&logoColor=white&label=Release&labelColor=darkgreen">
+<a href="https://github.com/stylebending/wineventengine/releases">
+  <img src="https://img.shields.io/github/v/release/stylebending/wineventengine?style=for-the-badge&color=darkgreen&logo=git&logoColor=white&label=Release&labelColor=darkgreen">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/releases">
-  <img src="https://img.shields.io/github/actions/workflow/status/stylebending/win_event_engine/.github/workflows/release.yml?style=for-the-badge&color=darkgreen&logo=github&logoColor=white&label=Build&labelColor=darkgreen">
+<a href="https://github.com/stylebending/wineventengine/releases">
+  <img src="https://img.shields.io/github/actions/workflow/status/stylebending/wineventengine/.github/workflows/release.yml?style=for-the-badge&color=darkgreen&logo=github&logoColor=white&label=Build&labelColor=darkgreen">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/releases">
-  <img src="https://img.shields.io/github/downloads/stylebending/win_event_engine/total?color=darkgreen&logo=github&label=Total%20Downloads&style=for-the-badge&labelColor=darkgreen">
+<a href="https://github.com/stylebending/wineventengine/releases">
+  <img src="https://img.shields.io/github/downloads/stylebending/wineventengine/total?color=darkgreen&logo=github&label=Total%20Downloads&style=for-the-badge&labelColor=darkgreen">
 </a>
 
 </p>
@@ -22,15 +22,15 @@
 
 <p align="center">
 
-<a href="https://github.com/stylebending/win_event_engine/wiki">
+<a href="https://github.com/stylebending/wineventengine/wiki">
   <img src="https://img.shields.io/badge/📖-Documentation%20Wiki-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/wiki#first-time-setup-5-minutes">
+<a href="https://github.com/stylebending/wineventengine/wiki#first-time-setup-5-minutes">
   <img src="https://img.shields.io/badge/🚀-First%20Time%20Setup-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/wiki#next-steps">
+<a href="https://github.com/stylebending/wineventengine/wiki#next-steps">
   <img src="https://img.shields.io/badge/🧭-Next%20Steps-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
@@ -38,15 +38,15 @@
 
 <p align="center">
 
-<a href="https://github.com/stylebending/win_event_engine/wiki/Configuration-Reference">
+<a href="https://github.com/stylebending/wineventengine/wiki/Configuration-Reference">
   <img src="https://img.shields.io/badge/⚙️-Configuration-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/wiki/Lua-Scripting-API">
+<a href="https://github.com/stylebending/wineventengine/wiki/Lua-Scripting-API">
   <img src="https://img.shields.io/badge/🔧-Lua%20Scripting-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/wiki#common-commands">
+<a href="https://github.com/stylebending/wineventengine/wiki#common-commands">
   <img src="https://img.shields.io/badge/💻-Commands-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
@@ -54,11 +54,11 @@
 
 <p align="center">
 
-<a href="https://github.com/stylebending/win_event_engine/wiki#running-as-a-windows-service">
+<a href="https://github.com/stylebending/wineventengine/wiki#running-as-a-windows-service">
   <img src="https://img.shields.io/badge/🪟-Windows%20Service-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/wiki/Web-Dashboard">
+<a href="https://github.com/stylebending/wineventengine/wiki/Web-Dashboard">
   <img src="https://img.shields.io/badge/📊-Web%20Dashboard-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
@@ -66,11 +66,11 @@
 
 <p align="center">
 
-<a href="https://github.com/stylebending/win_event_engine/blob/main/LICENSE">
+<a href="https://github.com/stylebending/wineventengine/blob/main/LICENSE">
   <img src="https://img.shields.io/badge/📄-MIT%20License-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
-<a href="https://github.com/stylebending/win_event_engine/blob/main/CONTRIBUTING.md">
+<a href="https://github.com/stylebending/wineventengine/blob/main/CONTRIBUTING.md">
   <img src="https://img.shields.io/badge/🪽-Contributing-darkblue?style=for-the-badge&labelColor=darkblue">
 </a>
 
@@ -100,9 +100,9 @@ Win Event Engine is an event-driven automation framework for Windows:
 
 ## Support
 
-- 📖 [Documentation Wiki](https://github.com/stylebending/win_event_engine/wiki) for all information
-- 💡 [Discussions](https://github.com/stylebending/win_event_engine/discussions) for feature requests and questions
-- 🐛 [Issue Tracker](https://github.com/stylebending/win_event_engine/issues) for bug reports and issues
+- 📖 [Documentation Wiki](https://github.com/stylebending/wineventengine/wiki) for all information
+- 💡 [Discussions](https://github.com/stylebending/wineventengine/discussions) for feature requests and questions
+- 🐛 [Issue Tracker](https://github.com/stylebending/wineventengine/issues) for bug reports and issues
 - 🔨 [CONTRIBUTING.md](CONTRIBUTING.md) for development guidelines
 
 ## License

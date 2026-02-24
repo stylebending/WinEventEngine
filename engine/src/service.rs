@@ -250,14 +250,14 @@ pub fn run_service() {
 
 pub fn get_service_log_path() -> PathBuf {
     let program_data = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
-    let log_dir = PathBuf::from(program_data).join("win_event_engine").join("logs");
+    let log_dir = PathBuf::from(program_data).join("wineventengine").join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
     log_dir.join("service.log")
 }
 
 pub fn get_default_config_path() -> PathBuf {
     let program_data = std::env::var("PROGRAMDATA").unwrap_or_else(|_| "C:\\ProgramData".to_string());
-    let config_dir = PathBuf::from(program_data).join("win_event_engine").join("config");
+    let config_dir = PathBuf::from(program_data).join("wineventengine").join("config");
     let _ = std::fs::create_dir_all(&config_dir);
     config_dir.join("config.toml")
 }
