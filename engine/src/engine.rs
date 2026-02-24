@@ -10,9 +10,10 @@ use engine_core::plugin::EventSourcePlugin;
 use metrics::{
     record_event_processing_duration, record_rule_match_duration, MetricsCollector,
 };
+use metrics::server::RuleManager;
 use rules::{EventKindMatcher, FilePatternMatcher, Rule, RuleMatcher, WindowMatcher, WindowEventType};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout, Instant};
 use tracing::{error, info, warn};
@@ -20,8 +21,10 @@ use tracing::{error, info, warn};
 pub struct Engine {
     config: Config,
     config_path: Option<PathBuf>,
+    automations_path: Option<PathBuf>,
     plugins: Vec<Box<dyn EventSourcePlugin>>,
     rules: Vec<Rule>,
+    rule_configs: Arc<RwLock<Vec<RuleConfig>>>,
     action_executor: ActionExecutor,
     event_sender: Option<mpsc::Sender<engine_core::event::Event>>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -33,11 +36,37 @@ impl Engine {
     pub fn new(config: Config, config_path: Option<PathBuf>) -> Self {
         let metrics = Arc::new(MetricsCollector::new());
         
+        // Determine automations file path (same directory as config, or current dir)
+        let automations_path = config_path.as_ref().map(|p| {
+            p.parent()
+                .map(|p| p.join("automations.json"))
+                .unwrap_or_else(|| PathBuf::from("automations.json"))
+        }).unwrap_or_else(|| PathBuf::from("automations.json"));
+        
+        // Load existing automations from file if it exists
+        let mut rule_configs: Vec<RuleConfig> = config.rules.clone();
+        if automations_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&automations_path) {
+                if let Ok(loaded) = serde_json::from_str::<Vec<RuleConfig>>(&content) {
+                    // Merge: add automations that don't exist in config
+                    let loaded_count = loaded.len();
+                    for rule in loaded {
+                        if !rule_configs.iter().any(|r| r.name == rule.name) {
+                            rule_configs.push(rule);
+                        }
+                    }
+                    info!("Loaded {} rules from automations.json", loaded_count);
+                }
+            }
+        }
+        
         Self {
             config,
             config_path,
+            automations_path: Some(automations_path),
             plugins: Vec::new(),
             rules: Vec::new(),
+            rule_configs: Arc::new(RwLock::new(rule_configs)),
             action_executor: ActionExecutor::new(),
             event_sender: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -750,6 +779,273 @@ public class MediaKeys {
 
     pub fn shutdown_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.shutdown_flag.clone()
+    }
+
+    pub fn rule_configs(&self) -> Arc<RwLock<Vec<RuleConfig>>> {
+        self.rule_configs.clone()
+    }
+
+    pub fn create_rule_manager(&self) -> EngineRuleManager {
+        EngineRuleManager {
+            rule_configs: self.rule_configs.clone(),
+            automations_path: self.automations_path.clone(),
+        }
+    }
+}
+
+pub struct EngineRuleManager {
+    rule_configs: Arc<RwLock<Vec<RuleConfig>>>,
+    automations_path: Option<PathBuf>,
+}
+
+impl EngineRuleManager {
+    fn save_to_file(&self) {
+        if let Some(ref path) = self.automations_path {
+            let configs = self.rule_configs.read().unwrap();
+            match serde_json::to_string_pretty(&*configs) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(path, json) {
+                        error!("Failed to save automations: {}", e);
+                    } else {
+                        info!("Saved {} rules to automations.json", configs.len());
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to serialize automations: {}", e);
+                }
+            }
+        }
+    }
+}
+
+impl RuleManager for EngineRuleManager {
+    fn get_rules(&self) -> Vec<serde_json::Value> {
+        let configs = self.rule_configs.read().unwrap();
+        configs
+            .iter()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect()
+    }
+
+    fn add_rule(&self, rule: serde_json::Value) -> Result<serde_json::Value, String> {
+        let rule_config: RuleConfig = serde_json::from_value(rule)
+            .map_err(|e| format!("Invalid rule format: {}", e))?;
+
+        if rule_config.name.is_empty() {
+            return Err("Rule name cannot be empty".to_string());
+        }
+
+        let mut configs = self.rule_configs.write().unwrap();
+        
+        if configs.iter().any(|r| r.name == rule_config.name) {
+            return Err(format!("Rule '{}' already exists", rule_config.name));
+        }
+
+        configs.push(rule_config.clone());
+        drop(configs);
+        self.save_to_file();
+
+        Ok(serde_json::to_value(rule_config).unwrap())
+    }
+
+    fn update_rule(&self, name: &str, rule: serde_json::Value) -> Result<serde_json::Value, String> {
+        let rule_config: RuleConfig = serde_json::from_value(rule)
+            .map_err(|e| format!("Invalid rule format: {}", e))?;
+
+        let mut configs = self.rule_configs.write().unwrap();
+        
+        if let Some(existing) = configs.iter_mut().find(|r| r.name == name) {
+            *existing = rule_config.clone();
+            drop(configs);
+            self.save_to_file();
+            
+            Ok(serde_json::to_value(rule_config).unwrap())
+        } else {
+            Err(format!("Rule '{}' not found", name))
+        }
+    }
+
+    fn delete_rule(&self, name: &str) -> Result<(), String> {
+        let mut configs = self.rule_configs.write().unwrap();
+        let initial_len = configs.len();
+        configs.retain(|r| r.name != name);
+        
+        if configs.len() < initial_len {
+            drop(configs);
+            self.save_to_file();
+            Ok(())
+        } else {
+            Err(format!("Rule '{}' not found", name))
+        }
+    }
+
+    fn enable_rule(&self, name: &str, enabled: bool) -> Result<(), String> {
+        let mut configs = self.rule_configs.write().unwrap();
+        
+        if let Some(rule) = configs.iter_mut().find(|r| r.name == name) {
+            rule.enabled = enabled;
+            drop(configs);
+            self.save_to_file();
+            Ok(())
+        } else {
+            Err(format!("Rule '{}' not found", name))
+        }
+    }
+
+    fn validate_rule(&self, rule: serde_json::Value) -> Result<(), String> {
+        let rule_config: RuleConfig = serde_json::from_value(rule)
+            .map_err(|e| format!("Invalid rule format: {}", e))?;
+
+        if rule_config.name.is_empty() {
+            return Err("Rule name cannot be empty".to_string());
+        }
+
+        match &rule_config.trigger {
+            TriggerConfig::FileCreated { pattern } |
+            TriggerConfig::FileModified { pattern } |
+            TriggerConfig::FileDeleted { pattern } => {
+                if let Some(p) = pattern {
+                    glob::Pattern::new(p)
+                        .map_err(|e| format!("Invalid pattern '{}': {}", p, e))?;
+                }
+            }
+            _ => {}
+        }
+
+        match &rule_config.action {
+            ActionConfig::Execute { command, .. } => {
+                if command.is_empty() {
+                    return Err("Execute command cannot be empty".to_string());
+                }
+            }
+            ActionConfig::PowerShell { script, .. } => {
+                if script.is_empty() {
+                    return Err("PowerShell script cannot be empty".to_string());
+                }
+            }
+            ActionConfig::Log { message, .. } => {
+                if message.is_empty() {
+                    return Err("Log message cannot be empty".to_string());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn test_rule_match(&self, rule: serde_json::Value, event_json: &str) -> Result<bool, String> {
+        let rule_config: RuleConfig = serde_json::from_value(rule)
+            .map_err(|e| format!("Invalid rule format: {}", e))?;
+
+        let event: engine_core::event::Event = serde_json::from_str(event_json)
+            .map_err(|e| format!("Invalid event JSON: {}", e))?;
+
+        let matcher: Box<dyn RuleMatcher> = match &rule_config.trigger {
+            TriggerConfig::FileCreated { pattern } => {
+                let mut matcher = FilePatternMatcher::created();
+                if let Some(pat) = pattern {
+                    matcher = matcher
+                        .with_file_pattern(pat)
+                        .map_err(|e| format!("Invalid pattern: {}", e))?;
+                }
+                Box::new(matcher)
+            }
+            TriggerConfig::FileModified { pattern } => {
+                let mut matcher = FilePatternMatcher::modified();
+                if let Some(pat) = pattern {
+                    matcher = matcher
+                        .with_file_pattern(pat)
+                        .map_err(|e| format!("Invalid pattern: {}", e))?;
+                }
+                Box::new(matcher)
+            }
+            TriggerConfig::FileDeleted { pattern } => {
+                let mut matcher = FilePatternMatcher::deleted();
+                if let Some(pat) = pattern {
+                    matcher = matcher
+                        .with_file_pattern(pat)
+                        .map_err(|e| format!("Invalid pattern: {}", e))?;
+                }
+                Box::new(matcher)
+            }
+            TriggerConfig::WindowFocused {
+                title_contains,
+                process_name,
+            } => Box::new(WindowMatcher {
+                event_type: WindowEventType::Focused,
+                title_contains: title_contains.clone(),
+                process_name: process_name.clone(),
+            }),
+            TriggerConfig::WindowUnfocused {
+                title_contains,
+                process_name,
+            } => Box::new(WindowMatcher {
+                event_type: WindowEventType::Unfocused,
+                title_contains: title_contains.clone(),
+                process_name: process_name.clone(),
+            }),
+            TriggerConfig::WindowCreated => Box::new(EventKindMatcher {
+                kind: EventKind::WindowCreated {
+                    hwnd: 0,
+                    title: String::new(),
+                    process_id: 0,
+                },
+            }),
+            TriggerConfig::ProcessStarted { process_name: _ } => Box::new(EventKindMatcher {
+                kind: EventKind::ProcessStarted {
+                    pid: 0,
+                    parent_pid: 0,
+                    name: String::new(),
+                    path: String::new(),
+                    command_line: String::new(),
+                    session_id: 0,
+                    user: String::new(),
+                },
+            }),
+            TriggerConfig::ProcessStopped { process_name: _ } => Box::new(EventKindMatcher {
+                kind: EventKind::ProcessStopped {
+                    pid: 0,
+                    name: String::new(),
+                    exit_code: None,
+                },
+            }),
+            TriggerConfig::RegistryChanged { value_name: _ } => Box::new(EventKindMatcher {
+                kind: EventKind::RegistryChanged {
+                    root: String::new(),
+                    key: String::new(),
+                    value_name: None,
+                    change_type: engine_core::event::RegistryChangeType::Modified,
+                },
+            }),
+            TriggerConfig::Timer { interval_seconds: _ } => Box::new(EventKindMatcher {
+                kind: EventKind::TimerTick,
+            }),
+        };
+
+        Ok(matcher.matches(&event))
+    }
+
+    fn export_rules(&self) -> Result<String, String> {
+        let rules = self.get_rules();
+        serde_json::to_string_pretty(&rules)
+            .map_err(|e| format!("Failed to serialize rules: {}", e))
+    }
+
+    fn import_rules(&self, content: &str) -> Result<usize, String> {
+        let rules: Vec<RuleConfig> = serde_json::from_str(content)
+            .map_err(|e| format!("Invalid rules format: {}", e))?;
+
+        let mut count = 0;
+        let mut configs = self.rule_configs.write().unwrap();
+        for rule in rules {
+            if !configs.iter().any(|r| r.name == rule.name) {
+                configs.push(rule);
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 }
 

@@ -18,6 +18,16 @@
 
 <br>
 
+<p align="center">
+
+<a href="https://discord.gg/tv65exPKgP">
+  <img src="https://img.shields.io/discord/1475639162416660500?logo=discord&label=Discord&style=for-the-badge&labelColor=black">
+</a>
+
+</p>
+
+<br>
+
 <h3 align="center">Quick Navigation</h3>
 
 <p align="center">
@@ -100,6 +110,7 @@ Win Event Engine is an event-driven automation framework for Windows:
 
 ## Support
 
+- 💬 [Join our Discord](https://discord.gg/tv65exPKgP) if you want to
 - 📖 [Documentation Wiki](https://github.com/stylebending/win_event_engine/wiki) for all information
 - 💡 [Discussions](https://github.com/stylebending/win_event_engine/discussions) for feature requests and questions
 - 🐛 [Issue Tracker](https://github.com/stylebending/win_event_engine/issues) for bug reports and issues

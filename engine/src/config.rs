@@ -104,40 +104,40 @@ pub struct RuleConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TriggerConfig {
     FileCreated {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },
     FileModified {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },
     FileDeleted {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },
     WindowFocused {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         title_contains: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         process_name: Option<String>,
     },
     WindowUnfocused {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         title_contains: Option<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         process_name: Option<String>,
     },
     WindowCreated,
     ProcessStarted {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         process_name: Option<String>,
     },
     ProcessStopped {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         process_name: Option<String>,
     },
     RegistryChanged {
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         value_name: Option<String>,
     },
     Timer {
@@ -155,14 +155,14 @@ fn default_timer_interval() -> u64 {
 pub enum ActionConfig {
     Execute {
         command: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         args: Vec<String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         working_dir: Option<PathBuf>,
     },
     PowerShell {
         script: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         working_dir: Option<PathBuf>,
     },
     Log {
@@ -178,9 +178,9 @@ pub enum ActionConfig {
         url: String,
         #[serde(default = "default_http_method")]
         method: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
         headers: HashMap<String, String>,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<String>,
     },
     Media {
@@ -190,7 +190,7 @@ pub enum ActionConfig {
         path: PathBuf,
         #[serde(default = "default_script_function")]
         function: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ms: Option<u64>,
         #[serde(default = "default_script_on_error")]
         on_error: String,

@@ -227,7 +227,8 @@ async fn main() {
     // Start metrics server and cleanup task
     let metrics = engine_instance.metrics();
     metrics.start_cleanup_task().await;
-    let metrics_server = MetricsServer::new(metrics, 9090);
+    let rule_manager = engine_instance.create_rule_manager();
+    let metrics_server = MetricsServer::with_rule_manager(metrics, 9090, rule_manager);
     tokio::spawn(async move {
         if let Err(e) = metrics_server.start().await {
             error!("Metrics server error: {}", e);
