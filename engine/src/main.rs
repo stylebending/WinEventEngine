@@ -367,6 +367,7 @@ fn create_demo_config() -> config::Config {
             name: "text_file_created".to_string(),
             description: Some("Detect when text files are created".to_string()),
             trigger: TriggerConfig::FileCreated {
+                path: None,
                 pattern: Some("*.txt".to_string()),
             },
             action: ActionConfig::Log {

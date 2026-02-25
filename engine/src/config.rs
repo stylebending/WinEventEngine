@@ -105,13 +105,19 @@ pub struct RuleConfig {
 pub enum TriggerConfig {
     FileCreated {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },
     FileModified {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },
     FileDeleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pattern: Option<String>,
     },

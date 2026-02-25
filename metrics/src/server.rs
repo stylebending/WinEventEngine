@@ -729,15 +729,6 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             };
         }
 
-        function scheduleReconnect() {
-            if (reconnectInterval > maxReconnectInterval) {
-                reconnectInterval = maxReconnectInterval;
-            }
-            console.log(`Reconnecting in ${reconnectInterval}ms...`);
-            reconnectInterval = Math.min(reconnectInterval * 2, maxReconnectInterval);
-            connect();
-        }
-        
         function formatUptime(seconds) {
             if (!seconds || seconds < 0) return '0s';
             const h = Math.floor(seconds / 3600);
@@ -748,7 +739,6 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             return `${s}s`;
         }
 
-        // Reconnection logic with exponential backoff
         function scheduleReconnect() {
             setTimeout(() => {
                 console.log(`Reconnecting in ${reconnectInterval}ms...`);
@@ -1287,7 +1277,8 @@ const AUTOMATION_EDITOR_HTML: &str = r#"<!DOCTYPE html>
             document.getElementById("pathGroup").style.display = triggerType.startsWith("file") ? "block" : "none";
             document.getElementById("patternGroup").style.display = triggerType.startsWith("file") ? "block" : "none";
             document.getElementById("titleContainsGroup").style.display = (triggerType === "window_focused" || triggerType === "window_unfocused") ? "block" : "none";
-            document.getElementById("processNameGroup").style.display = (triggerType === "process_started" || triggerType === "process_stopped") ? "block" : "none";
+            document.getElementById("processNameGroup").style.display = 
+                (triggerType === "process_started" || triggerType === "process_stopped" || triggerType === "window_focused" || triggerType === "window_unfocused") ? "block" : "none";
             document.getElementById("timerGroup").style.display = triggerType === "timer" ? "block" : "none";
             document.getElementById("valueNameGroup").style.display = triggerType === "registry_changed" ? "block" : "none";
             

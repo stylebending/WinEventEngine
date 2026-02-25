@@ -297,7 +297,8 @@ impl Engine {
     }
 
     fn initialize_rules(&mut self) {
-        for rule_config in &self.config.rules {
+        let configs = self.rule_configs.read().unwrap();
+        for rule_config in configs.iter() {
             if !rule_config.enabled {
                 continue;
             }
@@ -316,7 +317,7 @@ impl Engine {
 
     fn create_rule(&self, config: &RuleConfig) -> Result<Rule, EngineError> {
         let matcher: Box<dyn RuleMatcher> = match &config.trigger {
-            TriggerConfig::FileCreated { pattern } => {
+            TriggerConfig::FileCreated { pattern, .. } => {
                 let mut matcher = FilePatternMatcher::created();
                 if let Some(pat) = pattern {
                     matcher = matcher
@@ -325,7 +326,7 @@ impl Engine {
                 }
                 Box::new(matcher)
             }
-            TriggerConfig::FileModified { pattern } => {
+            TriggerConfig::FileModified { pattern, .. } => {
                 let mut matcher = FilePatternMatcher::modified();
                 if let Some(pat) = pattern {
                     matcher = matcher
@@ -334,7 +335,7 @@ impl Engine {
                 }
                 Box::new(matcher)
             }
-            TriggerConfig::FileDeleted { pattern } => {
+            TriggerConfig::FileDeleted { pattern, .. } => {
                 let mut matcher = FilePatternMatcher::deleted();
                 if let Some(pat) = pattern {
                     matcher = matcher
@@ -901,9 +902,9 @@ impl RuleManager for EngineRuleManager {
         }
 
         match &rule_config.trigger {
-            TriggerConfig::FileCreated { pattern } |
-            TriggerConfig::FileModified { pattern } |
-            TriggerConfig::FileDeleted { pattern } => {
+            TriggerConfig::FileCreated { pattern, .. } |
+            TriggerConfig::FileModified { pattern, .. } |
+            TriggerConfig::FileDeleted { pattern, .. } => {
                 if let Some(p) = pattern {
                     glob::Pattern::new(p)
                         .map_err(|e| format!("Invalid pattern '{}': {}", p, e))?;
@@ -942,7 +943,7 @@ impl RuleManager for EngineRuleManager {
             .map_err(|e| format!("Invalid event JSON: {}", e))?;
 
         let matcher: Box<dyn RuleMatcher> = match &rule_config.trigger {
-            TriggerConfig::FileCreated { pattern } => {
+            TriggerConfig::FileCreated { pattern, .. } => {
                 let mut matcher = FilePatternMatcher::created();
                 if let Some(pat) = pattern {
                     matcher = matcher
@@ -951,7 +952,7 @@ impl RuleManager for EngineRuleManager {
                 }
                 Box::new(matcher)
             }
-            TriggerConfig::FileModified { pattern } => {
+            TriggerConfig::FileModified { pattern, .. } => {
                 let mut matcher = FilePatternMatcher::modified();
                 if let Some(pat) = pattern {
                     matcher = matcher
@@ -960,7 +961,7 @@ impl RuleManager for EngineRuleManager {
                 }
                 Box::new(matcher)
             }
-            TriggerConfig::FileDeleted { pattern } => {
+            TriggerConfig::FileDeleted { pattern, .. } => {
                 let mut matcher = FilePatternMatcher::deleted();
                 if let Some(pat) = pattern {
                     matcher = matcher
