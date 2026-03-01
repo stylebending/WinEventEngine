@@ -14,16 +14,6 @@
 
 <br>
 
-<p align="center">
-
-<a href="https://discord.gg/tv65exPKgP">
-  <img src="https://img.shields.io/discord/1475639162416660500?logo=discord&label=Discord&style=for-the-badge&labelColor=black">
-</a>
-
-</p>
-
-<br>
-
 <h3 align="center">Quick Navigation</h3>
 
 <p align="center">
