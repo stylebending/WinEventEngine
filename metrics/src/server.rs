@@ -212,11 +212,14 @@ async fn automation_new_handler(Query(params): Query<AutomationQuery>) -> Html<S
     let html = if let Some(name) = params.name {
         // For editing, we'll add a script to fetch and populate the form
         let mut editor_html = AUTOMATION_EDITOR_HTML.to_string();
+        let escaped_name = name.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
         let fetch_script = format!(r#"
         <script>
         document.addEventListener('DOMContentLoaded', async () => {{
-            document.getElementById('pageTitle').textContent = 'Edit Automation: {}';
-            const response = await fetch(`/api/rules/{}`);
+            const ruleName = '{}';
+            document.getElementById('pageTitle').textContent = 'Edit Automation: ' + ruleName;
+            document.getElementById('submitBtn').textContent = 'Update Automation';
+            const response = await fetch(`/api/rules/${{encodeURIComponent(ruleName)}}`);
             if (response.ok) {{
                 const data = await response.json();
                 if (data.success && data.data) {{
@@ -225,34 +228,36 @@ async fn automation_new_handler(Query(params): Query<AutomationQuery>) -> Html<S
                     document.getElementById('name').readOnly = true;
                     document.getElementById('description').value = rule.description || '';
                     
-                    // Set trigger type first
+                    // Set trigger type
                     const triggerType = rule.trigger?.type || 'file_created';
                     document.getElementById('triggerType').value = triggerType;
-                    updateTriggerFields();
-                    
-                    // Fill trigger fields based on type
-                    if (rule.trigger) {{
-                        if (triggerType.startsWith('file_') && rule.trigger.pattern) {{
-                            document.getElementById('pattern').value = rule.trigger.pattern;
-                        }}
-                        if ((triggerType === 'window_focused' || triggerType === 'window_unfocused') && rule.trigger.title_contains) {{
-                            document.getElementById('titleContains').value = rule.trigger.title_contains;
-                        }}
-                        if ((triggerType === 'process_started' || triggerType === 'process_stopped') && rule.trigger.process_name) {{
-                            document.getElementById('processName').value = rule.trigger.process_name;
-                        }}
-                        if (triggerType === 'timer' && rule.trigger.interval_seconds) {{
-                            document.getElementById('intervalSeconds').value = rule.trigger.interval_seconds;
-                        }}
-                        if (triggerType === 'registry_changed' && rule.trigger.value_name) {{
-                            document.getElementById('valueName').value = rule.trigger.value_name;
-                        }}
-                    }}
                     
                     // Set action type
                     const actionType = rule.action?.type || 'log';
                     document.getElementById('actionType').value = actionType;
-                    updateActionFields();
+                    
+                    // Update field visibility based on selected types
+                    updateFields();
+                    
+                    // Fill trigger fields based on type
+                    if (rule.trigger) {{
+                        if (triggerType.startsWith('file_')) {{
+                            if (rule.trigger.path) document.getElementById('path').value = rule.trigger.path;
+                            if (rule.trigger.pattern) document.getElementById('pattern').value = rule.trigger.pattern;
+                        }}
+                        if (rule.trigger.title_contains) {{
+                            document.getElementById('titleContains').value = rule.trigger.title_contains;
+                        }}
+                        if (rule.trigger.process_name) {{
+                            document.getElementById('processName').value = rule.trigger.process_name;
+                        }}
+                        if (rule.trigger.interval_seconds) {{
+                            document.getElementById('intervalSeconds').value = rule.trigger.interval_seconds;
+                        }}
+                        if (rule.trigger.value_name) {{
+                            document.getElementById('valueName').value = rule.trigger.value_name;
+                        }}
+                    }}
                     
                     // Fill action fields based on type
                     if (rule.action) {{
@@ -262,8 +267,10 @@ async fn automation_new_handler(Query(params): Query<AutomationQuery>) -> Html<S
                         }} else if (actionType === 'execute') {{
                             if (rule.action.command) document.getElementById('executeCommand').value = rule.action.command;
                             if (rule.action.args) document.getElementById('executeArgs').value = rule.action.args.join(' ');
+                            if (rule.action.working_dir) document.getElementById('executeWorkingDir').value = rule.action.working_dir;
                         }} else if (actionType === 'powershell') {{
                             if (rule.action.script) document.getElementById('powershellScript').value = rule.action.script;
+                            if (rule.action.working_dir) document.getElementById('powershellWorkingDir').value = rule.action.working_dir;
                         }} else if (actionType === 'notify') {{
                             if (rule.action.title) document.getElementById('notifyTitle').value = rule.action.title;
                             if (rule.action.message) document.getElementById('notifyMessage').value = rule.action.message;
@@ -277,10 +284,41 @@ async fn automation_new_handler(Query(params): Query<AutomationQuery>) -> Html<S
                     }}
                     
                     document.getElementById('enabled').checked = rule.enabled !== false;
+                    
+                    // Override form submit to use PUT for edit mode
+                    const form = document.getElementById('ruleForm');
+                    const originalHandler = form.onsubmit;
+                    form.removeEventListener('submit', form._submitHandler);
+                    form.addEventListener('submit', async (e) => {{
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                        const formData = new FormData(e.target);
+                        const triggerT = formData.get('triggerType');
+                        let trigger = {{ type: triggerT }};
+                        if (formData.get('pattern')) trigger.pattern = formData.get('pattern');
+                        if (formData.get('path')) trigger.path = formData.get('path');
+                        if (formData.get('titleContains')) trigger.title_contains = formData.get('titleContains');
+                        if (formData.get('processName')) trigger.process_name = formData.get('processName');
+                        if (formData.get('intervalSeconds')) trigger.interval_seconds = parseInt(formData.get('intervalSeconds'));
+                        if (formData.get('valueName')) trigger.value_name = formData.get('valueName');
+                        const actionT = formData.get('actionType');
+                        let action = {{ type: actionT }};
+                        if (actionT === 'log') {{ action.message = formData.get('logMessage'); action.level = formData.get('logLevel'); }}
+                        else if (actionT === 'execute') {{ action.command = formData.get('executeCommand'); action.args = formData.get('executeArgs').split(' ').filter(a => a); }}
+                        else if (actionT === 'powershell') {{ action.script = formData.get('powershellScript'); }}
+                        else if (actionT === 'notify') {{ action.title = formData.get('notifyTitle'); action.message = formData.get('notifyMessage'); }}
+                        else if (actionT === 'http_request') {{ action.url = formData.get('httpUrl'); action.method = formData.get('httpMethod'); action.body = formData.get('httpBody'); action.headers = {{}}; }}
+                        else if (actionT === 'media') {{ action.command = formData.get('mediaCommand'); }}
+                        const ruleData = {{ name: formData.get('name'), description: formData.get('description') || null, trigger, action, enabled: formData.get('enabled') === 'on' }};
+                        const resp = await fetch(`/api/rules/${{encodeURIComponent(rule.name)}}`, {{ method: 'PUT', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(ruleData) }});
+                        const result = await resp.json();
+                        if (result.success) {{ window.location.href = '/automations'; }}
+                        else {{ alert('Error: ' + (result.error || 'Unknown error')); }}
+                    }});
                 }}
             }}
         }});
-        </script>"#, name, name);
+        </script>"#, escaped_name);
         
         // Insert the script before the closing </body> tag
         if let Some(pos) = editor_html.rfind("</body>") {
@@ -556,12 +594,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
 
     <script>
-        // WebSocket connection management
-        let ws = null;
-        let reconnectInterval = 1000;
-        let maxReconnectInterval = 30000;
-        let eventBuffer = [];
+        // Event filtering
         let currentFilter = 'all';
+
+        // Uptime tracking (in seconds, updated from snapshots)
+        let uptimeSeconds = 0;
 
         // Chart instances
         let eventsChart, matchesChart, actionsChart;
@@ -570,6 +607,25 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         const eventsData = new Array(60).fill(0);
         const matchesData = new Array(60).fill(0);
         const actionsData = new Array(60).fill(0);
+
+        // Load persisted metrics from sessionStorage (survives page navigation)
+        let actionSuccessCount = parseInt(sessionStorage.getItem('actionSuccessCount') || '0');
+        let actionErrorCount = parseInt(sessionStorage.getItem('actionErrorCount') || '0');
+        let lastSecondEvents = 0;
+        let lastSecondMatches = 0;
+
+        // Helper to persist metrics
+        function persistMetrics() {
+            try {
+                sessionStorage.setItem('actionSuccessCount', actionSuccessCount);
+                sessionStorage.setItem('actionErrorCount', actionErrorCount);
+            } catch(e) {}
+        }
+
+        // Update display with persisted values on load
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('actionsCount').textContent = actionSuccessCount + actionErrorCount;
+        });
 
         // Initialize charts
         function initCharts() {
@@ -646,6 +702,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         let reconnectInterval = 1000;
         const maxReconnectInterval = 30000;
         let isConnecting = false;
+        let hasEverConnected = false;
 
         function connect() {
             // Prevent multiple simultaneous connection attempts
@@ -654,13 +711,15 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 return;
             }
             
-            // Check sessionStorage for existing connection
+            // Check if we just navigated from another page (recent connection)
+            // If so, don't show "Disconnected" - keep showing last known state briefly
             try {
-                const wasConnected = sessionStorage.getItem('ws_connected');
-                // If we were connected recently, wait a bit before reconnecting
-                if (wasConnected === 'true' && ws && ws.readyState === WebSocket.OPEN) {
-                    console.log('WebSocket already connected');
-                    return;
+                const lastConnected = sessionStorage.getItem('ws_last_connected');
+                const now = Date.now();
+                if (lastConnected && (now - parseInt(lastConnected)) < 5000) {
+                    // We were connected in the last 5 seconds (page navigation)
+                    // Show as "Connecting" without the red disconnected state
+                    document.getElementById('statusText').textContent = 'Connecting...';
                 }
             } catch(e) {}
 
@@ -679,11 +738,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
             ws.onopen = () => {
                 console.log('WebSocket connected');
+                hasEverConnected = true;
                 updateStatus(true);
                 reconnectInterval = 1000;
                 isConnecting = false;
                 try {
                     sessionStorage.setItem('ws_connected', 'true');
+                    sessionStorage.setItem('ws_last_connected', Date.now().toString());
                 } catch(e) {}
             };
 
@@ -692,18 +753,14 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     const data = JSON.parse(event.data);
                     handleMessage(data);
                     
-                    // Update uptime from health messages
+                    // Update uptime from health or snapshot messages
                     if (data.type === 'health' && data.data && data.data.uptime_seconds !== undefined) {
-                        const uptimeEl = document.getElementById('uptime');
-                        if (uptimeEl) {
-                            uptimeEl.textContent = formatUptime(data.data.uptime_seconds);
-                        }
+                        uptimeSeconds = Math.floor(data.data.uptime_seconds);
+                        document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
                     }
-                    if (data.type === 'snapshot' && data.gauges && data.gauges['engine_uptime_seconds'] !== undefined) {
-                        const uptimeEl = document.getElementById('uptime');
-                        if (uptimeEl) {
-                            uptimeEl.textContent = formatUptime(data.gauges['engine_uptime_seconds']);
-                        }
+                    if (data.type === 'snapshot' && data.data && data.data.gauges && data.data.gauges['engine_uptime_seconds'] !== undefined) {
+                        uptimeSeconds = Math.floor(data.data.gauges['engine_uptime_seconds']);
+                        document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
                     }
                 } catch (e) {
                     console.error('Failed to parse message:', e);
@@ -712,10 +769,15 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
-                updateStatus(false);
+                // Only show disconnected if we had ever successfully connected
+                // This prevents "Disconnected" flash on initial page load
+                if (hasEverConnected) {
+                    updateStatus(false);
+                }
                 isConnecting = false;
                 try {
                     sessionStorage.setItem('ws_connected', 'false');
+                    sessionStorage.setItem('ws_last_disconnected', Date.now().toString());
                 } catch(e) {}
                 // Add delay before reconnecting
                 setTimeout(() => {
@@ -764,10 +826,6 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         // Handle incoming WebSocket messages
         let eventCount = 0;
         let matchCount = 0;
-        let actionSuccessCount = 0;
-        let actionErrorCount = 0;
-        let lastSecondEvents = 0;
-        let lastSecondMatches = 0;
 
         function handleMessage(data) {
             switch(data.type) {
@@ -787,6 +845,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     } else {
                         actionErrorCount++;
                     }
+                    persistMetrics();
                     addEventToLog('action', `Action: ${data.data.action_name}`,
                         data.data.success ? 'success' : 'error');
                     break;
@@ -878,15 +937,19 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
             document.getElementById('actionsCount').textContent =
                 actionSuccessCount + actionErrorCount;
-            actionsChart.data.datasets[0].data = [actionSuccessCount, actionErrorCount];
-            actionsChart.update('none');
+            if (actionsChart) {
+                actionsChart.data.datasets[0].data = [actionSuccessCount, actionErrorCount];
+                actionsChart.update('none');
+            }
 
             lastSecondEvents = 0;
             lastSecondMatches = 0;
 
-            const uptime = document.getElementById('uptime');
-            const current = parseInt(uptime.textContent) || 0;
-            uptime.textContent = (current + 1) + 's';
+            uptimeSeconds++;
+            document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
+            
+            // Persist metrics periodically
+            persistMetrics();
         }, 1000);
 
         // Initialize
@@ -988,9 +1051,9 @@ const AUTOMATIONS_HTML: &str = r#"<!DOCTYPE html>
                         <td>${rule.trigger.type}</td>
                         <td>${rule.action.type}</td>
                         <td class="actions">
-                            <button class="btn" onclick="toggleRule('${rule.name}', ${!rule.enabled})">${rule.enabled ? 'Disable' : 'Enable'}</button>
+                            <button class="btn" onclick="toggleRule(this)" data-name="${rule.name.replace(/"/g, '&quot;')}" data-enabled="${!rule.enabled}">${rule.enabled ? 'Disable' : 'Enable'}</button>
                             <a href="/automations/new?name=${encodeURIComponent(rule.name)}" class="btn">Edit</a>
-                            <button class="btn btn-danger" onclick="deleteRule('${rule.name}')">Delete</button>
+                            <button class="btn btn-danger" onclick="deleteRule(this)" data-name="${rule.name.replace(/"/g, '&quot;')}">Delete</button>
                         </td>
                     </tr>
                 `).join('');
@@ -1001,8 +1064,10 @@ const AUTOMATIONS_HTML: &str = r#"<!DOCTYPE html>
             }
         }
         
-        async function toggleRule(name, enabled) {
-            await fetch(`/api/rules/${name}/enable`, {
+        async function toggleRule(btn) {
+            const name = btn.dataset.name;
+            const enabled = btn.dataset.enabled === 'true';
+            await fetch(`/api/rules/${encodeURIComponent(name)}/enable`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({enabled})
@@ -1010,9 +1075,10 @@ const AUTOMATIONS_HTML: &str = r#"<!DOCTYPE html>
             loadRules();
         }
         
-        async function deleteRule(name) {
+        async function deleteRule(btn) {
+            const name = btn.dataset.name;
             if (confirm(`Delete automation "${name}"?`)) {
-                await fetch(`/api/rules/${name}`, {method: 'DELETE'});
+                await fetch(`/api/rules/${encodeURIComponent(name)}`, {method: 'DELETE'});
                 loadRules();
             }
         }
@@ -1152,8 +1218,9 @@ const AUTOMATION_EDITOR_HTML: &str = r#"<!DOCTYPE html>
                     <input type="text" name="titleContains" id="titleContains" placeholder="Part of window title">
                 </div>
                 <div class="form-group" id="processNameGroup" style="display:none">
-                    <label>Process Name</label>
+                    <label>Process Name (optional)</label>
                     <input type="text" name="processName" id="processName" placeholder="chrome.exe, notepad.exe, etc.">
+                    <div class="hint">Additional filter by process name. Leave empty to match any process.</div>
                 </div>
                 <div class="form-group" id="timerGroup" style="display:none">
                     <label>Interval (seconds)</label>
@@ -1250,9 +1317,13 @@ const AUTOMATION_EDITOR_HTML: &str = r#"<!DOCTYPE html>
                     <div class="form-group">
                         <label>Command</label>
                         <select name="mediaCommand" id="mediaCommand">
-                            <option value="play">Play/Pause</option>
+                            <option value="play_pause">Play / Pause (toggle)</option>
+                            <option value="stop">Stop</option>
                             <option value="next">Next Track</option>
                             <option value="previous">Previous Track</option>
+                            <option value="volume_up">Volume Up</option>
+                            <option value="volume_down">Volume Down</option>
+                            <option value="mute">Mute / Unmute (toggle)</option>
                         </select>
                     </div>
                 </div>

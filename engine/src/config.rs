@@ -86,6 +86,18 @@ pub enum SourceType {
     },
 }
 
+impl SourceType {
+    /// Returns the source type name string for comparison with TriggerConfig::required_source_type()
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            SourceType::FileWatcher { .. } => "file_watcher",
+            SourceType::WindowWatcher { .. } => "window_watcher",
+            SourceType::ProcessMonitor { .. } => "process_monitor",
+            SourceType::RegistryMonitor { .. } => "registry_monitor",
+        }
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -96,7 +108,7 @@ pub struct RuleConfig {
     pub description: Option<String>,
     pub trigger: TriggerConfig,
     pub action: ActionConfig,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enabled: bool,
 }
 
@@ -154,6 +166,26 @@ pub enum TriggerConfig {
 
 fn default_timer_interval() -> u64 {
     60
+}
+
+impl TriggerConfig {
+    /// Returns the source plugin type name required for this trigger to work,
+    /// or None if no external source is needed (e.g., Timer).
+    pub fn required_source_type(&self) -> Option<&'static str> {
+        match self {
+            TriggerConfig::FileCreated { .. }
+            | TriggerConfig::FileModified { .. }
+            | TriggerConfig::FileDeleted { .. } => Some("file_watcher"),
+            TriggerConfig::WindowFocused { .. }
+            | TriggerConfig::WindowUnfocused { .. }
+            | TriggerConfig::WindowCreated => Some("window_watcher"),
+            TriggerConfig::ProcessStarted { .. } | TriggerConfig::ProcessStopped { .. } => {
+                Some("process_monitor")
+            }
+            TriggerConfig::RegistryChanged { .. } => Some("registry_monitor"),
+            TriggerConfig::Timer { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

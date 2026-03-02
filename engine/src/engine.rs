@@ -12,6 +12,7 @@ use metrics::{
 };
 use metrics::server::RuleManager;
 use rules::{EventKindMatcher, FilePatternMatcher, Rule, RuleMatcher, WindowMatcher, WindowEventType};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
@@ -23,13 +24,15 @@ pub struct Engine {
     config_path: Option<PathBuf>,
     automations_path: Option<PathBuf>,
     plugins: Vec<Box<dyn EventSourcePlugin>>,
-    rules: Vec<Rule>,
+    rules: Arc<RwLock<Vec<Rule>>>,
     rule_configs: Arc<RwLock<Vec<RuleConfig>>>,
-    action_executor: ActionExecutor,
+    action_executor: Arc<RwLock<ActionExecutor>>,
     event_sender: Option<mpsc::Sender<engine_core::event::Event>>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
     config_reload_rx: Option<mpsc::Receiver<()>>,
     metrics: Arc<MetricsCollector>,
+    /// Tracks which source plugin types are currently running
+    running_source_types: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Engine {
@@ -65,13 +68,14 @@ impl Engine {
             config_path,
             automations_path: Some(automations_path),
             plugins: Vec::new(),
-            rules: Vec::new(),
+            rules: Arc::new(RwLock::new(Vec::new())),
             rule_configs: Arc::new(RwLock::new(rule_configs)),
-            action_executor: ActionExecutor::new(),
+            action_executor: Arc::new(RwLock::new(ActionExecutor::new())),
             event_sender: None,
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_reload_rx: None,
             metrics,
+            running_source_types: Arc::new(RwLock::new(HashSet::new())),
         }
     }
     
@@ -94,13 +98,10 @@ impl Engine {
         // Initialize plugins from configuration
         self.initialize_plugins(sender.clone()).await?;
 
-        // Initialize rules from configuration
-        self.initialize_rules();
+        // Build rules and actions from all rule configs (TOML + automations.json)
+        self.rebuild_rules_and_actions();
 
-        // Initialize actions from configuration
-        self.initialize_actions();
-
-        // Start event processing loop
+        // Start event processing loop with shared state
         let rules = self.rules.clone();
         let action_executor = self.action_executor.clone();
         let metrics = self.metrics.clone();
@@ -118,7 +119,11 @@ impl Engine {
 
                 tracing::debug!("Processing event: {:?} from {}", event.kind, event.source);
 
-                for (idx, rule) in rules.iter().enumerate() {
+                // Read current rules snapshot (allows hot-reload)
+                let current_rules = rules.read().unwrap().clone();
+                let current_executor = action_executor.read().unwrap().clone();
+
+                for (idx, rule) in current_rules.iter().enumerate() {
                     if !rule.enabled {
                         continue;
                     }
@@ -138,7 +143,7 @@ impl Engine {
                         let action_name = format!("rule_{}_action", idx);
                         let action_start = Instant::now();
 
-                        match action_executor.execute(&action_name, &event) {
+                        match current_executor.execute(&action_name, &event) {
                             Ok(result) => {
                                 metrics.record_action_execution_with_broadcast(
                                     &action_name,
@@ -166,6 +171,10 @@ impl Engine {
             info!("Event processing loop stopped");
         });
 
+        // Set engine status gauges for dashboard
+        let status = self.get_status();
+        self.metrics.set_engine_status(status.active_plugins, status.active_rules);
+
         info!("Engine initialized successfully");
         Ok(())
     }
@@ -174,6 +183,7 @@ impl Engine {
         &mut self,
         sender: mpsc::Sender<engine_core::event::Event>,
     ) -> Result<(), EngineError> {
+        let mut running = self.running_source_types.write().unwrap();
         for source_config in &self.config.sources {
             if !source_config.enabled {
                 info!("Skipping disabled source: {}", source_config.name);
@@ -183,6 +193,7 @@ impl Engine {
             match self.create_plugin(source_config, sender.clone()).await {
                 Ok(plugin) => {
                     info!("Initialized plugin: {}", source_config.name);
+                    running.insert(source_config.source_type.type_name().to_string());
                     self.plugins.push(plugin);
                 }
                 Err(e) => {
@@ -190,6 +201,7 @@ impl Engine {
                 }
             }
         }
+        drop(running);
 
         Ok(())
     }
@@ -296,283 +308,36 @@ impl Engine {
         }
     }
 
-    fn initialize_rules(&mut self) {
+    /// Rebuild rules and actions from current rule_configs.
+    /// This is called on initialization and when rules are modified via the dashboard.
+    fn rebuild_rules_and_actions(&self) {
         let configs = self.rule_configs.read().unwrap();
-        for rule_config in configs.iter() {
-            if !rule_config.enabled {
-                continue;
-            }
+        let mut new_rules = Vec::new();
+        let mut new_executor = ActionExecutor::new();
 
-            match self.create_rule(rule_config) {
+        for (idx, rule_config) in configs.iter().enumerate() {
+            match create_rule(rule_config) {
                 Ok(rule) => {
                     info!("Loaded rule: {}", rule.name);
-                    self.rules.push(rule);
+                    new_rules.push(rule);
                 }
                 Err(e) => {
                     error!("Failed to create rule {}: {}", rule_config.name, e);
                 }
             }
-        }
-    }
 
-    fn create_rule(&self, config: &RuleConfig) -> Result<Rule, EngineError> {
-        let matcher: Box<dyn RuleMatcher> = match &config.trigger {
-            TriggerConfig::FileCreated { pattern, .. } => {
-                let mut matcher = FilePatternMatcher::created();
-                if let Some(pat) = pattern {
-                    matcher = matcher
-                        .with_file_pattern(pat)
-                        .map_err(|e| EngineError::Config(format!("Invalid pattern: {}", e)))?;
-                }
-                Box::new(matcher)
-            }
-            TriggerConfig::FileModified { pattern, .. } => {
-                let mut matcher = FilePatternMatcher::modified();
-                if let Some(pat) = pattern {
-                    matcher = matcher
-                        .with_file_pattern(pat)
-                        .map_err(|e| EngineError::Config(format!("Invalid pattern: {}", e)))?;
-                }
-                Box::new(matcher)
-            }
-            TriggerConfig::FileDeleted { pattern, .. } => {
-                let mut matcher = FilePatternMatcher::deleted();
-                if let Some(pat) = pattern {
-                    matcher = matcher
-                        .with_file_pattern(pat)
-                        .map_err(|e| EngineError::Config(format!("Invalid pattern: {}", e)))?;
-                }
-                        Box::new(matcher)
-            }
-            TriggerConfig::WindowFocused {
-                title_contains,
-                process_name,
-            } => Box::new(WindowMatcher {
-                event_type: WindowEventType::Focused,
-                title_contains: title_contains.clone(),
-                process_name: process_name.clone(),
-            }),
-            TriggerConfig::WindowUnfocused {
-                title_contains,
-                process_name,
-            } => Box::new(WindowMatcher {
-                event_type: WindowEventType::Unfocused,
-                title_contains: title_contains.clone(),
-                process_name: process_name.clone(),
-            }),
-            TriggerConfig::WindowCreated => Box::new(EventKindMatcher {
-                kind: EventKind::WindowCreated {
-                    hwnd: 0,
-                    title: String::new(),
-                    process_id: 0,
-                },
-            }),
-            TriggerConfig::ProcessStarted { process_name: _ } => Box::new(EventKindMatcher {
-                kind: EventKind::ProcessStarted {
-                    pid: 0,
-                    parent_pid: 0,
-                    name: String::new(),
-                    path: String::new(),
-                    command_line: String::new(),
-                    session_id: 0,
-                    user: String::new(),
-                },
-            }),
-            TriggerConfig::ProcessStopped { process_name: _ } => Box::new(EventKindMatcher {
-                kind: EventKind::ProcessStopped {
-                    pid: 0,
-                    name: String::new(),
-                    exit_code: None,
-                },
-            }),
-            TriggerConfig::RegistryChanged { value_name: _ } => Box::new(EventKindMatcher {
-                kind: EventKind::RegistryChanged {
-                    root: String::new(),
-                    key: String::new(),
-                    value_name: None,
-                    change_type: engine_core::event::RegistryChangeType::Modified,
-                },
-            }),
-            TriggerConfig::Timer {
-                interval_seconds: _,
-            } => Box::new(EventKindMatcher {
-                kind: EventKind::TimerTick,
-            }),
-        };
-
-        let mut rule = Rule::new(&config.name, matcher);
-
-        if let Some(desc) = &config.description {
-            rule = rule.with_description(desc);
-        }
-
-        Ok(rule.with_enabled(config.enabled))
-    }
-
-    fn initialize_actions(&mut self) {
-        // Register actions from rule configurations
-        for (idx, rule_config) in self.config.rules.iter().enumerate() {
             let action_name = format!("rule_{}_action", idx);
-            let action: Box<dyn Action> = match &rule_config.action {
-                ActionConfig::Execute {
-                    command,
-                    args,
-                    working_dir,
-                } => {
-                    let mut exec = ExecuteAction::new(command).with_args(args.clone());
-                    if let Some(dir) = working_dir {
-                        exec = exec.with_working_dir(dir.clone());
-                    }
-                    Box::new(exec)
-                }
-                ActionConfig::PowerShell {
-                    script,
-                    working_dir,
-                } => {
-                    let mut ps = PowerShellAction::new(script);
-                    if let Some(dir) = working_dir {
-                        ps = ps.with_working_dir(dir.clone());
-                    }
-                    Box::new(ps)
-                }
-                ActionConfig::Log { message, level } => {
-                    let log_level = match level.as_str() {
-                        "debug" => LogLevel::Debug,
-                        "info" => LogLevel::Info,
-                        "warn" => LogLevel::Warn,
-                        "error" => LogLevel::Error,
-                        _ => LogLevel::Info,
-                    };
-                    Box::new(LogAction::new(message).with_level(log_level))
-                }
-                ActionConfig::Notify { title, message } => {
-                    // For now, use log action as a placeholder for notifications
-                    Box::new(LogAction::new(format!("{}: {}", title, message)))
-                }
-                ActionConfig::HttpRequest { url, .. } => {
-                    // HTTP requests would need additional implementation
-                    Box::new(LogAction::new(format!("HTTP request to: {}", url)))
-                }
-                ActionConfig::Media { command } => {
-                    let script = match command.as_str() {
-                        "play" => {
-                            r#"
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class MediaKeys {
-    [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-    public const byte VK_MEDIA_PLAY_PAUSE = 0xB3;
-    public static void PlayPause() {
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, UIntPtr.Zero);
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 2, UIntPtr.Zero);
-    }
-}
-"@
-[MediaKeys]::PlayPause()
-"#
-                        }
-                        "pause" => {
-                            r#"
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class MediaKeys {
-    [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-    public const byte VK_MEDIA_PLAY_PAUSE = 0xB3;
-    public static void PlayPause() {
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, UIntPtr.Zero);
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 2, UIntPtr.Zero);
-    }
-}
-"@
-[MediaKeys]::PlayPause()
-"#
-                        }
-                        "toggle" => {
-                            r#"
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class MediaKeys {
-    [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-    public const byte VK_MEDIA_PLAY_PAUSE = 0xB3;
-    public static void PlayPause() {
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, UIntPtr.Zero);
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 2, UIntPtr.Zero);
-    }
-}
-"@
-[MediaKeys]::PlayPause()
-"#
-                        }
-                        _ => {
-                            r#"
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class MediaKeys {
-    [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-    public const byte VK_MEDIA_PLAY_PAUSE = 0xB3;
-    public static void PlayPause() {
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 0, UIntPtr.Zero);
-        keybd_event(VK_MEDIA_PLAY_PAUSE, 0, 2, UIntPtr.Zero);
-    }
-}
-"@
-[MediaKeys]::PlayPause()
-"#
-                        }
-                    };
-                    Box::new(PowerShellAction::new(script))
-                }
-                ActionConfig::Script {
-                    path,
-                    function,
-                    timeout_ms,
-                    on_error,
-                } => {
-                    use actions::{ScriptAction, ScriptErrorBehavior};
-                    
-                    // Resolve path relative to plugins/actions/ if not absolute
-                    let script_path = if path.is_absolute() {
-                        path.clone()
-                    } else {
-                        PathBuf::from("plugins/actions").join(path)
-                    };
-                    
-                    match ScriptAction::new(script_path, function.clone()) {
-                        Ok(mut script_action) => {
-                            // Set timeout if specified
-                            if let Some(timeout) = timeout_ms {
-                                script_action = script_action.with_timeout(*timeout);
-                            }
-                            
-                            // Set error behavior
-                            if let Ok(behavior) = on_error.parse::<ScriptErrorBehavior>() {
-                                script_action = script_action.with_error_behavior(behavior);
-                            }
-                            
-                            Box::new(script_action)
-                        }
-                        Err(e) => {
-                            error!("Failed to create script action: {}", e);
-                            // Fallback to log action showing the error
-                            Box::new(LogAction::new(format!(
-                                "Script action failed to load: {}",
-                                e
-                            )))
-                        }
-                    }
-                }
-            };
-
-            self.action_executor.register(action_name, action);
+            let action = create_action(&rule_config.action);
+            new_executor.register(action_name, action);
         }
+
+        let rule_count = new_rules.len();
+
+        // Write to shared state so the event processing loop picks up changes
+        *self.rules.write().unwrap() = new_rules;
+        *self.action_executor.write().unwrap() = new_executor;
+
+        info!("Rules rebuilt: {} active rules", rule_count);
     }
 
     pub async fn shutdown(&mut self) {
@@ -590,7 +355,7 @@ public class MediaKeys {
     pub fn get_status(&self) -> EngineStatus {
         EngineStatus {
             active_plugins: self.plugins.len(),
-            active_rules: self.rules.len(),
+            active_rules: self.rules.read().unwrap().len(),
         }
     }
 
@@ -602,7 +367,8 @@ public class MediaKeys {
                 "New configuration validation failed: {}, keeping current config",
                 e
             );
-            self.metrics.record_config_reload_with_broadcast(false);
+            let status = self.get_status();
+            self.metrics.record_config_reload_with_broadcast(false, status.active_plugins, status.active_rules);
             return Err(EngineError::Config(e.to_string()));
         }
 
@@ -613,80 +379,42 @@ public class MediaKeys {
             }
         }
         self.plugins.clear();
-        self.rules.clear();
+        self.running_source_types.write().unwrap().clear();
 
         self.config = new_config;
 
-        if let Some(sender) = &self.event_sender {
-            self.initialize_plugins(sender.clone()).await?;
-        }
-
-        self.initialize_rules();
-        self.initialize_actions();
-
-        if let Some(_sender) = &self.event_sender {
-            let rules = self.rules.clone();
-            let action_executor = self.action_executor.clone();
-            let metrics = self.metrics.clone();
-            let mut receiver = bus::create_event_bus(self.config.engine.event_buffer_size).1;
-
-            tokio::spawn(async move {
-                while let Some(event) = receiver.recv().await {
-                    let start_time = Instant::now();
-                    let event_source = event.source.clone();
-                    let event_type = format!("{:?}", event.kind);
-                    
-                    metrics.record_event_with_broadcast(&event_source, &event_type);
-
-                    tracing::debug!("Processing event: {:?} from {}", event.kind, event.source);
-
-                    for (idx, rule) in rules.iter().enumerate() {
-                        if !rule.enabled {
-                            continue;
-                        }
-
-                        metrics.record_rule_evaluation_with_broadcast(&rule.name);
-
-                        let match_start = Instant::now();
-                        let matched = rule.matches(&event);
-                        record_rule_match_duration(&metrics, &rule.name, match_start.elapsed());
-
-                        if matched {
-                            metrics.record_rule_match_with_broadcast(&rule.name);
-                            info!("Rule '{}' matched event from {}", rule.name, event.source);
-
-                            let action_name = format!("rule_{}_action", idx);
-                            let action_start = Instant::now();
-
-                            match action_executor.execute(&action_name, &event) {
-                                Ok(result) => {
-                                    metrics.record_action_execution_with_broadcast(
-                                        &action_name,
-                                        true,
-                                        action_start.elapsed()
-                                    );
-                                    info!("Action executed successfully: {:?}", result);
-                                }
-                                Err(e) => {
-                                    metrics.record_action_execution_with_broadcast(
-                                        &action_name,
-                                        false,
-                                        action_start.elapsed()
-                                    );
-                                    error!("Action execution failed: {}", e);
+        // Update rule_configs from new config (preserving automations.json rules)
+        {
+            let mut configs = self.rule_configs.write().unwrap();
+            *configs = self.config.rules.clone();
+            // Re-merge automations from file if it exists
+            if let Some(ref automations_path) = self.automations_path {
+                if automations_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(automations_path) {
+                        if let Ok(loaded) = serde_json::from_str::<Vec<RuleConfig>>(&content) {
+                            for rule in loaded {
+                                if !configs.iter().any(|r| r.name == rule.name) {
+                                    configs.push(rule);
                                 }
                             }
                         }
                     }
-
-                    record_event_processing_duration(&metrics, start_time.elapsed());
                 }
-            });
+            }
         }
-        
-        self.metrics.record_config_reload_with_broadcast(true);
+
+        // Restart plugins with existing event sender
+        if let Some(sender) = &self.event_sender {
+            self.initialize_plugins(sender.clone()).await?;
+        }
+
+        // Rebuild rules and actions — the existing event processing loop
+        // reads from the shared Arc<RwLock<>> and will pick these up automatically
+        self.rebuild_rules_and_actions();
 
         let status = self.get_status();
+        self.metrics.record_config_reload_with_broadcast(true, status.active_plugins, status.active_rules);
+        self.metrics.set_engine_status(status.active_plugins, status.active_rules);
         info!(
             "Config reload complete: {} plugins, {} rules",
             status.active_plugins, status.active_rules
@@ -786,17 +514,415 @@ public class MediaKeys {
         self.rule_configs.clone()
     }
 
+    /// Creates a rule manager for the web dashboard and spawns a background task
+    /// that auto-starts source plugins when rules require them.
     pub fn create_rule_manager(&self) -> EngineRuleManager {
+        let (plugin_request_tx, mut plugin_request_rx) = mpsc::channel::<SourceConfig>(16);
+
+        // Spawn background task that starts plugins on demand
+        let event_sender = self.event_sender.clone();
+        let running_source_types = self.running_source_types.clone();
+        let metrics = self.metrics.clone();
+
+        tokio::spawn(async move {
+            while let Some(source_config) = plugin_request_rx.recv().await {
+                let sender = match &event_sender {
+                    Some(s) => s.clone(),
+                    None => {
+                        error!("Cannot start plugin: no event sender available");
+                        continue;
+                    }
+                };
+
+                let type_name = source_config.source_type.type_name().to_string();
+                info!("Auto-provisioning source plugin: {} ({})", source_config.name, type_name);
+
+                match start_plugin(&source_config, sender).await {
+                    Ok(plugin) => {
+                        info!("Auto-provisioned plugin: {}", source_config.name);
+                        running_source_types.write().unwrap().insert(type_name);
+                        // Update plugin count gauge
+                        let count = running_source_types.read().unwrap().len();
+                        metrics.set_active_plugins(count);
+                        // Keep plugin alive by leaking it into a spawned task
+                        // (the plugin runs its own internal loop via tokio::spawn)
+                        std::mem::forget(plugin);
+                    }
+                    Err(e) => {
+                        error!("Failed to auto-provision plugin {}: {}", source_config.name, e);
+                    }
+                }
+            }
+        });
+
         EngineRuleManager {
             rule_configs: self.rule_configs.clone(),
+            rules: self.rules.clone(),
+            action_executor: self.action_executor.clone(),
+            metrics: self.metrics.clone(),
             automations_path: self.automations_path.clone(),
+            running_source_types: self.running_source_types.clone(),
+            plugin_request_tx,
+        }
+    }
+}
+
+/// Start a plugin from a SourceConfig. Standalone async function for use
+/// by both Engine::create_plugin and the auto-provisioning background task.
+async fn start_plugin(
+    config: &SourceConfig,
+    sender: mpsc::Sender<engine_core::event::Event>,
+) -> Result<Box<dyn EventSourcePlugin>, EngineError> {
+    match &config.source_type {
+        SourceType::FileWatcher {
+            paths,
+            pattern,
+            recursive,
+        } => {
+            let mut plugin =
+                FileWatcherPlugin::new(&config.name, paths.clone()).with_recursive(*recursive);
+            if let Some(pattern) = pattern {
+                plugin = plugin.with_pattern(pattern);
+            }
+            plugin
+                .start(sender)
+                .await
+                .map_err(|e| EngineError::PluginInit(config.name.clone(), e.to_string()))?;
+            Ok(Box::new(plugin))
+        }
+        SourceType::WindowWatcher {
+            title_pattern,
+            process_pattern,
+        } => {
+            let mut plugin = WindowEventPlugin::new(&config.name);
+            if let Some(title) = title_pattern {
+                plugin = plugin.with_title_filter(title);
+            }
+            if let Some(process) = process_pattern {
+                plugin = plugin.with_process_filter(process);
+            }
+            plugin
+                .start(sender)
+                .await
+                .map_err(|e| EngineError::PluginInit(config.name.clone(), e.to_string()))?;
+            Ok(Box::new(plugin))
+        }
+        SourceType::ProcessMonitor {
+            process_name,
+            monitor_threads,
+            monitor_files,
+            monitor_network,
+        } => {
+            let mut plugin = ProcessMonitorPlugin::new(&config.name)
+                .with_thread_monitoring(*monitor_threads)
+                .with_file_monitoring(*monitor_files)
+                .with_network_monitoring(*monitor_network);
+            if let Some(name) = process_name {
+                plugin = plugin.with_name_filter(name);
+            }
+            plugin
+                .start(sender)
+                .await
+                .map_err(|e| EngineError::PluginInit(config.name.clone(), e.to_string()))?;
+            Ok(Box::new(plugin))
+        }
+        SourceType::RegistryMonitor {
+            root,
+            key,
+            recursive,
+        } => {
+            let root_enum = match root.as_str() {
+                "HKLM" => RegistryRoot::HKEY_LOCAL_MACHINE,
+                "HKCU" => RegistryRoot::HKEY_CURRENT_USER,
+                "HKU" => RegistryRoot::HKEY_USERS,
+                "HKCC" => RegistryRoot::HKEY_CURRENT_CONFIG,
+                _ => {
+                    return Err(EngineError::Config(format!(
+                        "Invalid registry root: {}",
+                        root
+                    )));
+                }
+            };
+            let mut plugin = if *recursive {
+                RegistryMonitorPlugin::new(&config.name).watch_key_recursive(root_enum, key)
+            } else {
+                RegistryMonitorPlugin::new(&config.name).watch_key(root_enum, key)
+            };
+            plugin
+                .start(sender)
+                .await
+                .map_err(|e| EngineError::PluginInit(config.name.clone(), e.to_string()))?;
+            Ok(Box::new(plugin))
+        }
+    }
+}
+
+/// Create a default SourceConfig for a given source type name.
+/// Used when auto-provisioning plugins for rules created via the dashboard.
+fn default_source_config(source_type_name: &str, trigger: &TriggerConfig) -> Option<SourceConfig> {
+    match source_type_name {
+        "window_watcher" => Some(SourceConfig {
+            name: "auto_window_watcher".to_string(),
+            source_type: SourceType::WindowWatcher {
+                title_pattern: None,
+                process_pattern: None,
+            },
+            enabled: true,
+        }),
+        "process_monitor" => Some(SourceConfig {
+            name: "auto_process_monitor".to_string(),
+            source_type: SourceType::ProcessMonitor {
+                process_name: None,
+                monitor_threads: false,
+                monitor_files: false,
+                monitor_network: false,
+            },
+            enabled: true,
+        }),
+        "file_watcher" => {
+            let path = match trigger {
+                TriggerConfig::FileCreated { path, .. }
+                | TriggerConfig::FileModified { path, .. }
+                | TriggerConfig::FileDeleted { path, .. } => {
+                    path.clone().unwrap_or_else(|| ".".to_string())
+                }
+                _ => ".".to_string(),
+            };
+            Some(SourceConfig {
+                name: format!("auto_file_watcher_{}", path.replace(['\\', '/', ':'], "_")),
+                source_type: SourceType::FileWatcher {
+                    paths: vec![PathBuf::from(path)],
+                    pattern: None,
+                    recursive: false,
+                },
+                enabled: true,
+            })
+        }
+        // registry_monitor cannot be auto-provisioned without knowing root+key
+        _ => None,
+    }
+}
+
+/// Create a Rule (with matcher) from a RuleConfig.
+/// Standalone function so both Engine and EngineRuleManager can use it.
+fn create_rule(config: &RuleConfig) -> Result<Rule, EngineError> {
+    let matcher: Box<dyn RuleMatcher> = match &config.trigger {
+        TriggerConfig::FileCreated { pattern, .. } => {
+            let mut matcher = FilePatternMatcher::created();
+            if let Some(pat) = pattern {
+                matcher = matcher
+                    .with_file_pattern(pat)
+                    .map_err(|e| EngineError::Config(format!("Invalid pattern: {}", e)))?;
+            }
+            Box::new(matcher)
+        }
+        TriggerConfig::FileModified { pattern, .. } => {
+            let mut matcher = FilePatternMatcher::modified();
+            if let Some(pat) = pattern {
+                matcher = matcher
+                    .with_file_pattern(pat)
+                    .map_err(|e| EngineError::Config(format!("Invalid pattern: {}", e)))?;
+            }
+            Box::new(matcher)
+        }
+        TriggerConfig::FileDeleted { pattern, .. } => {
+            let mut matcher = FilePatternMatcher::deleted();
+            if let Some(pat) = pattern {
+                matcher = matcher
+                    .with_file_pattern(pat)
+                    .map_err(|e| EngineError::Config(format!("Invalid pattern: {}", e)))?;
+            }
+            Box::new(matcher)
+        }
+        TriggerConfig::WindowFocused {
+            title_contains,
+            process_name,
+        } => Box::new(WindowMatcher {
+            event_type: WindowEventType::Focused,
+            title_contains: title_contains.clone(),
+            process_name: process_name.clone(),
+        }),
+        TriggerConfig::WindowUnfocused {
+            title_contains,
+            process_name,
+        } => Box::new(WindowMatcher {
+            event_type: WindowEventType::Unfocused,
+            title_contains: title_contains.clone(),
+            process_name: process_name.clone(),
+        }),
+        TriggerConfig::WindowCreated => Box::new(EventKindMatcher {
+            kind: EventKind::WindowCreated {
+                hwnd: 0,
+                title: String::new(),
+                process_id: 0,
+            },
+        }),
+        TriggerConfig::ProcessStarted { process_name: _ } => Box::new(EventKindMatcher {
+            kind: EventKind::ProcessStarted {
+                pid: 0,
+                parent_pid: 0,
+                name: String::new(),
+                path: String::new(),
+                command_line: String::new(),
+                session_id: 0,
+                user: String::new(),
+            },
+        }),
+        TriggerConfig::ProcessStopped { process_name: _ } => Box::new(EventKindMatcher {
+            kind: EventKind::ProcessStopped {
+                pid: 0,
+                name: String::new(),
+                exit_code: None,
+            },
+        }),
+        TriggerConfig::RegistryChanged { value_name: _ } => Box::new(EventKindMatcher {
+            kind: EventKind::RegistryChanged {
+                root: String::new(),
+                key: String::new(),
+                value_name: None,
+                change_type: engine_core::event::RegistryChangeType::Modified,
+            },
+        }),
+        TriggerConfig::Timer {
+            interval_seconds: _,
+        } => Box::new(EventKindMatcher {
+            kind: EventKind::TimerTick,
+        }),
+    };
+
+    let mut rule = Rule::new(&config.name, matcher);
+
+    if let Some(desc) = &config.description {
+        rule = rule.with_description(desc);
+    }
+
+    Ok(rule.with_enabled(config.enabled))
+}
+
+/// Create an Action from an ActionConfig.
+/// Standalone function so both Engine and EngineRuleManager can use it.
+fn create_action(action_config: &ActionConfig) -> Box<dyn Action> {
+    match action_config {
+        ActionConfig::Execute {
+            command,
+            args,
+            working_dir,
+        } => {
+            let mut exec = ExecuteAction::new(command).with_args(args.clone());
+            if let Some(dir) = working_dir {
+                exec = exec.with_working_dir(dir.clone());
+            }
+            Box::new(exec)
+        }
+        ActionConfig::PowerShell {
+            script,
+            working_dir,
+        } => {
+            let mut ps = PowerShellAction::new(script);
+            if let Some(dir) = working_dir {
+                ps = ps.with_working_dir(dir.clone());
+            }
+            Box::new(ps)
+        }
+        ActionConfig::Log { message, level } => {
+            let log_level = match level.as_str() {
+                "debug" => LogLevel::Debug,
+                "info" => LogLevel::Info,
+                "warn" => LogLevel::Warn,
+                "error" => LogLevel::Error,
+                _ => LogLevel::Info,
+            };
+            Box::new(LogAction::new(message).with_level(log_level))
+        }
+        ActionConfig::Notify { title, message } => {
+            // For now, use log action as a placeholder for notifications
+            Box::new(LogAction::new(format!("{}: {}", title, message)))
+        }
+        ActionConfig::HttpRequest { url, .. } => {
+            // HTTP requests would need additional implementation
+            Box::new(LogAction::new(format!("HTTP request to: {}", url)))
+        }
+        ActionConfig::Media { command } => {
+            let vk_code = match command.as_str() {
+                "play_pause" | "play" | "pause" | "toggle" => "0xB3", // VK_MEDIA_PLAY_PAUSE
+                "next" => "0xB0",                       // VK_MEDIA_NEXT_TRACK
+                "previous" => "0xB1",                   // VK_MEDIA_PREV_TRACK
+                "stop" => "0xB2",                       // VK_MEDIA_STOP
+                "volume_up" => "0xAF",                  // VK_VOLUME_UP
+                "volume_down" => "0xAE",                // VK_VOLUME_DOWN
+                "mute" => "0xAD",                       // VK_VOLUME_MUTE
+                _ => "0xB3",                            // Default to play/pause
+            };
+            let script = format!(
+                r#"
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class MediaKeys {{
+    [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)]
+    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    public static void SendKey(byte vk) {{
+        keybd_event(vk, 0, 0, UIntPtr.Zero);
+        keybd_event(vk, 0, 2, UIntPtr.Zero);
+    }}
+}}
+"@
+[MediaKeys]::SendKey({})
+"#,
+                vk_code
+            );
+            Box::new(PowerShellAction::new(&script))
+        }
+        ActionConfig::Script {
+            path,
+            function,
+            timeout_ms,
+            on_error,
+        } => {
+            use actions::{ScriptAction, ScriptErrorBehavior};
+            
+            // Resolve path relative to plugins/actions/ if not absolute
+            let script_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                PathBuf::from("plugins/actions").join(path)
+            };
+            
+            match ScriptAction::new(script_path, function.clone()) {
+                Ok(mut script_action) => {
+                    // Set timeout if specified
+                    if let Some(timeout) = timeout_ms {
+                        script_action = script_action.with_timeout(*timeout);
+                    }
+                    
+                    // Set error behavior
+                    if let Ok(behavior) = on_error.parse::<ScriptErrorBehavior>() {
+                        script_action = script_action.with_error_behavior(behavior);
+                    }
+                    
+                    Box::new(script_action)
+                }
+                Err(e) => {
+                    error!("Failed to create script action: {}", e);
+                    // Fallback to log action showing the error
+                    Box::new(LogAction::new(format!(
+                        "Script action failed to load: {}",
+                        e
+                    )))
+                }
+            }
         }
     }
 }
 
 pub struct EngineRuleManager {
     rule_configs: Arc<RwLock<Vec<RuleConfig>>>,
+    rules: Arc<RwLock<Vec<Rule>>>,
+    action_executor: Arc<RwLock<ActionExecutor>>,
+    metrics: Arc<MetricsCollector>,
     automations_path: Option<PathBuf>,
+    running_source_types: Arc<RwLock<HashSet<String>>>,
+    plugin_request_tx: mpsc::Sender<SourceConfig>,
 }
 
 impl EngineRuleManager {
@@ -816,6 +942,75 @@ impl EngineRuleManager {
                 }
             }
         }
+    }
+
+    /// Rebuild the active rules and actions from the current rule_configs.
+    /// Called after any CRUD operation to make changes take effect immediately.
+    /// Also auto-provisions any source plugins required by the rules.
+    fn rebuild_active_rules(&self) {
+        let configs = self.rule_configs.read().unwrap();
+        let mut new_rules = Vec::new();
+        let mut new_executor = ActionExecutor::new();
+        let mut needed_source_types: HashSet<String> = HashSet::new();
+
+        for (idx, rule_config) in configs.iter().enumerate() {
+            match create_rule(rule_config) {
+                Ok(rule) => {
+                    info!("Loaded rule: {}", rule.name);
+                    new_rules.push(rule);
+                }
+                Err(e) => {
+                    error!("Failed to create rule {}: {}", rule_config.name, e);
+                }
+            }
+
+            let action_name = format!("rule_{}_action", idx);
+            let action = create_action(&rule_config.action);
+            new_executor.register(action_name, action);
+
+            // Track which source plugin types are needed
+            if rule_config.enabled {
+                if let Some(source_type) = rule_config.trigger.required_source_type() {
+                    needed_source_types.insert(source_type.to_string());
+                }
+            }
+        }
+
+        let rule_count = new_rules.len();
+
+        *self.rules.write().unwrap() = new_rules;
+        *self.action_executor.write().unwrap() = new_executor;
+
+        // Only update the rules gauge — don't touch active_plugins
+        self.metrics.set_active_rules(rule_count);
+
+        // Auto-provision missing source plugins
+        let running = self.running_source_types.read().unwrap();
+        for source_type in &needed_source_types {
+            if !running.contains(source_type) {
+                // Find a rule config that needs this source type to build a default config
+                let trigger = configs.iter()
+                    .find(|r| r.enabled && r.trigger.required_source_type() == Some(source_type.as_str()))
+                    .map(|r| &r.trigger);
+
+                if let Some(trigger) = trigger {
+                    if let Some(source_config) = default_source_config(source_type, trigger) {
+                        info!("Requesting auto-provision of source plugin: {}", source_type);
+                        if let Err(e) = self.plugin_request_tx.try_send(source_config) {
+                            error!("Failed to request plugin auto-provision: {}", e);
+                        }
+                    } else {
+                        warn!(
+                            "Cannot auto-provision '{}' plugin — requires manual configuration in config.toml",
+                            source_type
+                        );
+                    }
+                }
+            }
+        }
+        drop(running);
+
+        info!("Rules hot-reloaded: {} active rules", rule_count);
     }
 }
 
@@ -845,6 +1040,7 @@ impl RuleManager for EngineRuleManager {
         configs.push(rule_config.clone());
         drop(configs);
         self.save_to_file();
+        self.rebuild_active_rules();
 
         Ok(serde_json::to_value(rule_config).unwrap())
     }
@@ -859,6 +1055,7 @@ impl RuleManager for EngineRuleManager {
             *existing = rule_config.clone();
             drop(configs);
             self.save_to_file();
+            self.rebuild_active_rules();
             
             Ok(serde_json::to_value(rule_config).unwrap())
         } else {
@@ -874,6 +1071,7 @@ impl RuleManager for EngineRuleManager {
         if configs.len() < initial_len {
             drop(configs);
             self.save_to_file();
+            self.rebuild_active_rules();
             Ok(())
         } else {
             Err(format!("Rule '{}' not found", name))
@@ -887,6 +1085,7 @@ impl RuleManager for EngineRuleManager {
             rule.enabled = enabled;
             drop(configs);
             self.save_to_file();
+            self.rebuild_active_rules();
             Ok(())
         } else {
             Err(format!("Rule '{}' not found", name))
@@ -942,89 +1141,10 @@ impl RuleManager for EngineRuleManager {
         let event: engine_core::event::Event = serde_json::from_str(event_json)
             .map_err(|e| format!("Invalid event JSON: {}", e))?;
 
-        let matcher: Box<dyn RuleMatcher> = match &rule_config.trigger {
-            TriggerConfig::FileCreated { pattern, .. } => {
-                let mut matcher = FilePatternMatcher::created();
-                if let Some(pat) = pattern {
-                    matcher = matcher
-                        .with_file_pattern(pat)
-                        .map_err(|e| format!("Invalid pattern: {}", e))?;
-                }
-                Box::new(matcher)
-            }
-            TriggerConfig::FileModified { pattern, .. } => {
-                let mut matcher = FilePatternMatcher::modified();
-                if let Some(pat) = pattern {
-                    matcher = matcher
-                        .with_file_pattern(pat)
-                        .map_err(|e| format!("Invalid pattern: {}", e))?;
-                }
-                Box::new(matcher)
-            }
-            TriggerConfig::FileDeleted { pattern, .. } => {
-                let mut matcher = FilePatternMatcher::deleted();
-                if let Some(pat) = pattern {
-                    matcher = matcher
-                        .with_file_pattern(pat)
-                        .map_err(|e| format!("Invalid pattern: {}", e))?;
-                }
-                Box::new(matcher)
-            }
-            TriggerConfig::WindowFocused {
-                title_contains,
-                process_name,
-            } => Box::new(WindowMatcher {
-                event_type: WindowEventType::Focused,
-                title_contains: title_contains.clone(),
-                process_name: process_name.clone(),
-            }),
-            TriggerConfig::WindowUnfocused {
-                title_contains,
-                process_name,
-            } => Box::new(WindowMatcher {
-                event_type: WindowEventType::Unfocused,
-                title_contains: title_contains.clone(),
-                process_name: process_name.clone(),
-            }),
-            TriggerConfig::WindowCreated => Box::new(EventKindMatcher {
-                kind: EventKind::WindowCreated {
-                    hwnd: 0,
-                    title: String::new(),
-                    process_id: 0,
-                },
-            }),
-            TriggerConfig::ProcessStarted { process_name: _ } => Box::new(EventKindMatcher {
-                kind: EventKind::ProcessStarted {
-                    pid: 0,
-                    parent_pid: 0,
-                    name: String::new(),
-                    path: String::new(),
-                    command_line: String::new(),
-                    session_id: 0,
-                    user: String::new(),
-                },
-            }),
-            TriggerConfig::ProcessStopped { process_name: _ } => Box::new(EventKindMatcher {
-                kind: EventKind::ProcessStopped {
-                    pid: 0,
-                    name: String::new(),
-                    exit_code: None,
-                },
-            }),
-            TriggerConfig::RegistryChanged { value_name: _ } => Box::new(EventKindMatcher {
-                kind: EventKind::RegistryChanged {
-                    root: String::new(),
-                    key: String::new(),
-                    value_name: None,
-                    change_type: engine_core::event::RegistryChangeType::Modified,
-                },
-            }),
-            TriggerConfig::Timer { interval_seconds: _ } => Box::new(EventKindMatcher {
-                kind: EventKind::TimerTick,
-            }),
-        };
+        let rule = create_rule(&rule_config)
+            .map_err(|e| format!("Failed to create rule: {}", e))?;
 
-        Ok(matcher.matches(&event))
+        Ok(rule.matches(&event))
     }
 
     fn export_rules(&self) -> Result<String, String> {
@@ -1044,6 +1164,12 @@ impl RuleManager for EngineRuleManager {
                 configs.push(rule);
                 count += 1;
             }
+        }
+        drop(configs);
+
+        if count > 0 {
+            self.save_to_file();
+            self.rebuild_active_rules();
         }
 
         Ok(count)
