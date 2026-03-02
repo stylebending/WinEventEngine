@@ -4,11 +4,11 @@ use std::sync::Arc;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Path, Query, State,
     },
-    response::{Html, Json},
-    routing::get,
-    Router,
+    response::Html,
+    routing::{delete, get, post, put},
+    Json, Router,
 };
 use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
@@ -18,27 +18,75 @@ use tracing::{error, info};
 
 use crate::{MetricUpdate, MetricsCollector, MetricsSnapshot};
 
+pub trait RuleManager: Send + Sync {
+    fn get_rules(&self) -> Vec<serde_json::Value>;
+    fn add_rule(&self, rule: serde_json::Value) -> Result<serde_json::Value, String>;
+    fn update_rule(&self, name: &str, rule: serde_json::Value) -> Result<serde_json::Value, String>;
+    fn delete_rule(&self, name: &str) -> Result<(), String>;
+    fn enable_rule(&self, name: &str, enabled: bool) -> Result<(), String>;
+    fn validate_rule(&self, rule: serde_json::Value) -> Result<(), String>;
+    fn test_rule_match(&self, rule: serde_json::Value, event_json: &str) -> Result<bool, String>;
+    fn export_rules(&self) -> Result<String, String>;
+    fn import_rules(&self, content: &str) -> Result<usize, String>;
+}
+
+pub struct ApiState {
+    pub metrics: Arc<MetricsCollector>,
+    pub rule_manager: Option<Arc<dyn RuleManager>>,
+}
+
+impl ApiState {
+    pub fn new(metrics: Arc<MetricsCollector>) -> Self {
+        Self {
+            metrics,
+            rule_manager: None,
+        }
+    }
+
+    pub fn with_rule_manager<M: RuleManager + 'static>(mut self, manager: M) -> Self {
+        self.rule_manager = Some(Arc::new(manager));
+        self
+    }
+}
+
 /// HTTP server for serving metrics with WebSocket support
 pub struct MetricsServer {
-    collector: Arc<MetricsCollector>,
+    state: Arc<ApiState>,
     port: u16,
 }
 
 impl MetricsServer {
     /// Create a new metrics server
     pub fn new(collector: Arc<MetricsCollector>, port: u16) -> Self {
-        Self { collector, port }
+        let state = Arc::new(ApiState::new(collector));
+        Self { state, port }
+    }
+
+    /// Create a new metrics server with rule manager
+    pub fn with_rule_manager<M: RuleManager + 'static>(collector: Arc<MetricsCollector>, port: u16, manager: M) -> Self {
+        let state = Arc::new(ApiState::new(collector).with_rule_manager(manager));
+        Self { state, port }
     }
 
     /// Start the HTTP server
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         let app = Router::new()
             .route("/", get(root_handler))
-            .route("/metrics", get(metrics_handler))
-            .route("/api/snapshot", get(snapshot_handler))
-            .route("/health", get(health_handler))
+            .route("/automations", get(automations_handler))
+            .route("/automations/new", get(automation_new_handler))
+            .route("/test", get(test_handler))
+            .route("/import-export", get(import_export_handler))
             .route("/ws", get(websocket_handler))
-            .with_state(self.collector.clone());
+            .route("/api/rules", get(rules_list_handler))
+            .route("/api/rules", post(rules_create_handler))
+            .route("/api/rules/:name", get(rules_get_handler))
+            .route("/api/rules/:name", put(rules_update_handler))
+            .route("/api/rules/:name", delete(rules_delete_handler))
+            .route("/api/rules/:name/enable", post(rules_enable_handler))
+            .route("/api/rules/test", post(rules_validate_handler))
+            .route("/api/rules/export", get(rules_export_handler))
+            .route("/api/rules/import", post(rules_import_handler))
+            .with_state(self.state.clone());
 
         let addr = SocketAddr::from(([127, 0, 0, 1], self.port));
         info!("Starting metrics server on http://{}", addr);
@@ -54,9 +102,9 @@ impl MetricsServer {
 /// WebSocket handler - upgrades HTTP to WebSocket connection
 async fn websocket_handler(
     ws: WebSocketUpgrade,
-    State(collector): State<Arc<MetricsCollector>>,
+    State(state): State<Arc<ApiState>>,
 ) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, collector))
+    ws.on_upgrade(move |socket| handle_socket(socket, state.metrics.clone()))
 }
 
 /// Handle WebSocket connection
@@ -144,8 +192,154 @@ enum ClientCommand {
 }
 
 /// Root handler - full dashboard HTML
-async fn root_handler(State(_collector): State<Arc<MetricsCollector>>) -> Html<String> {
+async fn root_handler(State(_state): State<Arc<ApiState>>) -> Html<String> {
     Html(DASHBOARD_HTML.to_string())
+}
+
+/// Automations list page
+async fn automations_handler(State(_state): State<Arc<ApiState>>) -> Html<String> {
+    Html(AUTOMATIONS_HTML.to_string())
+}
+
+/// Query params for automation editor
+#[derive(Deserialize)]
+pub struct AutomationQuery {
+    name: Option<String>,
+}
+
+/// New/Edit automation page
+async fn automation_new_handler(Query(params): Query<AutomationQuery>) -> Html<String> {
+    let html = if let Some(name) = params.name {
+        // For editing, we'll add a script to fetch and populate the form
+        let mut editor_html = AUTOMATION_EDITOR_HTML.to_string();
+        let escaped_name = name.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
+        let fetch_script = format!(r#"
+        <script>
+        document.addEventListener('DOMContentLoaded', async () => {{
+            const ruleName = '{}';
+            document.getElementById('pageTitle').textContent = 'Edit Automation: ' + ruleName;
+            document.getElementById('submitBtn').textContent = 'Update Automation';
+            const response = await fetch(`/api/rules/${{encodeURIComponent(ruleName)}}`);
+            if (response.ok) {{
+                const data = await response.json();
+                if (data.success && data.data) {{
+                    const rule = data.data;
+                    document.getElementById('name').value = rule.name || '';
+                    document.getElementById('name').readOnly = true;
+                    document.getElementById('description').value = rule.description || '';
+                    
+                    // Set trigger type
+                    const triggerType = rule.trigger?.type || 'file_created';
+                    document.getElementById('triggerType').value = triggerType;
+                    
+                    // Set action type
+                    const actionType = rule.action?.type || 'log';
+                    document.getElementById('actionType').value = actionType;
+                    
+                    // Update field visibility based on selected types
+                    updateFields();
+                    
+                    // Fill trigger fields based on type
+                    if (rule.trigger) {{
+                        if (triggerType.startsWith('file_')) {{
+                            if (rule.trigger.path) document.getElementById('path').value = rule.trigger.path;
+                            if (rule.trigger.pattern) document.getElementById('pattern').value = rule.trigger.pattern;
+                        }}
+                        if (rule.trigger.title_contains) {{
+                            document.getElementById('titleContains').value = rule.trigger.title_contains;
+                        }}
+                        if (rule.trigger.process_name) {{
+                            document.getElementById('processName').value = rule.trigger.process_name;
+                        }}
+                        if (rule.trigger.interval_seconds) {{
+                            document.getElementById('intervalSeconds').value = rule.trigger.interval_seconds;
+                        }}
+                        if (rule.trigger.value_name) {{
+                            document.getElementById('valueName').value = rule.trigger.value_name;
+                        }}
+                    }}
+                    
+                    // Fill action fields based on type
+                    if (rule.action) {{
+                        if (actionType === 'log') {{
+                            if (rule.action.message) document.getElementById('logMessage').value = rule.action.message;
+                            if (rule.action.level) document.getElementById('logLevel').value = rule.action.level;
+                        }} else if (actionType === 'execute') {{
+                            if (rule.action.command) document.getElementById('executeCommand').value = rule.action.command;
+                            if (rule.action.args) document.getElementById('executeArgs').value = rule.action.args.join(' ');
+                            if (rule.action.working_dir) document.getElementById('executeWorkingDir').value = rule.action.working_dir;
+                        }} else if (actionType === 'powershell') {{
+                            if (rule.action.script) document.getElementById('powershellScript').value = rule.action.script;
+                            if (rule.action.working_dir) document.getElementById('powershellWorkingDir').value = rule.action.working_dir;
+                        }} else if (actionType === 'notify') {{
+                            if (rule.action.title) document.getElementById('notifyTitle').value = rule.action.title;
+                            if (rule.action.message) document.getElementById('notifyMessage').value = rule.action.message;
+                        }} else if (actionType === 'http_request') {{
+                            if (rule.action.url) document.getElementById('httpUrl').value = rule.action.url;
+                            if (rule.action.method) document.getElementById('httpMethod').value = rule.action.method;
+                            if (rule.action.body) document.getElementById('httpBody').value = rule.action.body;
+                        }} else if (actionType === 'media') {{
+                            if (rule.action.command) document.getElementById('mediaCommand').value = rule.action.command;
+                        }}
+                    }}
+                    
+                    document.getElementById('enabled').checked = rule.enabled !== false;
+                    
+                    // Override form submit to use PUT for edit mode
+                    const form = document.getElementById('ruleForm');
+                    const originalHandler = form.onsubmit;
+                    form.removeEventListener('submit', form._submitHandler);
+                    form.addEventListener('submit', async (e) => {{
+                        e.preventDefault();
+                        e.stopImmediatePropagation();
+                        const formData = new FormData(e.target);
+                        const triggerT = formData.get('triggerType');
+                        let trigger = {{ type: triggerT }};
+                        if (formData.get('pattern')) trigger.pattern = formData.get('pattern');
+                        if (formData.get('path')) trigger.path = formData.get('path');
+                        if (formData.get('titleContains')) trigger.title_contains = formData.get('titleContains');
+                        if (formData.get('processName')) trigger.process_name = formData.get('processName');
+                        if (formData.get('intervalSeconds')) trigger.interval_seconds = parseInt(formData.get('intervalSeconds'));
+                        if (formData.get('valueName')) trigger.value_name = formData.get('valueName');
+                        const actionT = formData.get('actionType');
+                        let action = {{ type: actionT }};
+                        if (actionT === 'log') {{ action.message = formData.get('logMessage'); action.level = formData.get('logLevel'); }}
+                        else if (actionT === 'execute') {{ action.command = formData.get('executeCommand'); action.args = formData.get('executeArgs').split(' ').filter(a => a); }}
+                        else if (actionT === 'powershell') {{ action.script = formData.get('powershellScript'); }}
+                        else if (actionT === 'notify') {{ action.title = formData.get('notifyTitle'); action.message = formData.get('notifyMessage'); }}
+                        else if (actionT === 'http_request') {{ action.url = formData.get('httpUrl'); action.method = formData.get('httpMethod'); action.body = formData.get('httpBody'); action.headers = {{}}; }}
+                        else if (actionT === 'media') {{ action.command = formData.get('mediaCommand'); }}
+                        const ruleData = {{ name: formData.get('name'), description: formData.get('description') || null, trigger, action, enabled: formData.get('enabled') === 'on' }};
+                        const resp = await fetch(`/api/rules/${{encodeURIComponent(rule.name)}}`, {{ method: 'PUT', headers: {{'Content-Type': 'application/json'}}, body: JSON.stringify(ruleData) }});
+                        const result = await resp.json();
+                        if (result.success) {{ window.location.href = '/automations'; }}
+                        else {{ alert('Error: ' + (result.error || 'Unknown error')); }}
+                    }});
+                }}
+            }}
+        }});
+        </script>"#, escaped_name);
+        
+        // Insert the script before the closing </body> tag
+        if let Some(pos) = editor_html.rfind("</body>") {
+            editor_html.insert_str(pos, &fetch_script);
+        }
+        editor_html
+    } else {
+        AUTOMATION_EDITOR_HTML.to_string()
+    };
+    
+    Html(html)
+}
+
+/// Test rule page
+async fn test_handler(State(_state): State<Arc<ApiState>>) -> Html<String> {
+    Html(TEST_RULE_HTML.to_string())
+}
+
+/// Import/Export page
+async fn import_export_handler(State(_state): State<Arc<ApiState>>) -> Html<String> {
+    Html(IMPORT_EXPORT_HTML.to_string())
 }
 
 /// Full dashboard HTML with embedded CSS and JavaScript
@@ -172,26 +366,31 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
         .header {
             background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-            padding: 1.5rem 2rem;
+            padding: 1rem 2rem;
             border-bottom: 1px solid #334155;
             display: flex;
-            justify-content: space-between;
             align-items: center;
+            gap: 1rem;
         }
 
         .header h1 {
             font-size: 1.5rem;
             color: #f8fafc;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin-right: auto;
         }
 
-        .connection-status {
+        .header .connection-status {
             display: flex;
             align-items: center;
             gap: 0.5rem;
             font-size: 0.875rem;
+            color: #94a3b8;
         }
 
-        .status-dot {
+        .header .status-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
@@ -199,8 +398,32 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             transition: background 0.3s;
         }
 
-        .status-dot.connected {
+        .header .status-dot.connected {
             background: #22c55e;
+        }
+
+        .nav {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .nav a {
+            color: #94a3b8;
+            text-decoration: none;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 0.875rem;
+            transition: all 0.2s;
+        }
+
+        .nav a:hover {
+            background: #334155;
+            color: #f8fafc;
+        }
+
+        .nav a.active {
+            background: #3b82f6;
+            color: #fff;
         }
 
         .container {
@@ -310,11 +533,13 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </head>
 <body>
     <div class="header">
-        <h1>WinEventEngine Dashboard</h1>
-        <div class="connection-status">
-            <div class="status-dot" id="statusDot"></div>
-            <span id="statusText">Connecting...</span>
-        </div>
+        <h1>WinEventEngine <span class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span></h1>
+        <nav class="nav">
+            <a href="/" class="active">Dashboard</a>
+            <a href="/automations">Automations</a>
+            <a href="/test">Test Rules</a>
+            <a href="/import-export">Import/Export</a>
+        </nav>
     </div>
 
     <div class="container">
@@ -369,12 +594,11 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
     </div>
 
     <script>
-        // WebSocket connection management
-        let ws = null;
-        let reconnectInterval = 1000;
-        let maxReconnectInterval = 30000;
-        let eventBuffer = [];
+        // Event filtering
         let currentFilter = 'all';
+
+        // Uptime tracking (in seconds, updated from snapshots)
+        let uptimeSeconds = 0;
 
         // Chart instances
         let eventsChart, matchesChart, actionsChart;
@@ -383,6 +607,25 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         const eventsData = new Array(60).fill(0);
         const matchesData = new Array(60).fill(0);
         const actionsData = new Array(60).fill(0);
+
+        // Load persisted metrics from sessionStorage (survives page navigation)
+        let actionSuccessCount = parseInt(sessionStorage.getItem('actionSuccessCount') || '0');
+        let actionErrorCount = parseInt(sessionStorage.getItem('actionErrorCount') || '0');
+        let lastSecondEvents = 0;
+        let lastSecondMatches = 0;
+
+        // Helper to persist metrics
+        function persistMetrics() {
+            try {
+                sessionStorage.setItem('actionSuccessCount', actionSuccessCount);
+                sessionStorage.setItem('actionErrorCount', actionErrorCount);
+            } catch(e) {}
+        }
+
+        // Update display with persisted values on load
+        document.addEventListener('DOMContentLoaded', () => {
+            document.getElementById('actionsCount').textContent = actionSuccessCount + actionErrorCount;
+        });
 
         // Initialize charts
         function initCharts() {
@@ -453,24 +696,72 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                 }
             });
         }
+ 
+        // WebSocket connection - use sessionStorage to prevent multiple connections
+        let ws = null;
+        let reconnectInterval = 1000;
+        const maxReconnectInterval = 30000;
+        let isConnecting = false;
+        let hasEverConnected = false;
 
-        // Connect to WebSocket
         function connect() {
+            // Prevent multiple simultaneous connection attempts
+            if (isConnecting) {
+                console.log('Already connecting, skipping...');
+                return;
+            }
+            
+            // Check if we just navigated from another page (recent connection)
+            // If so, don't show "Disconnected" - keep showing last known state briefly
+            try {
+                const lastConnected = sessionStorage.getItem('ws_last_connected');
+                const now = Date.now();
+                if (lastConnected && (now - parseInt(lastConnected)) < 5000) {
+                    // We were connected in the last 5 seconds (page navigation)
+                    // Show as "Connecting" without the red disconnected state
+                    document.getElementById('statusText').textContent = 'Connecting...';
+                }
+            } catch(e) {}
+
+            isConnecting = true;
+            
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/ws`;
 
-            ws = new WebSocket(wsUrl);
+            try {
+                ws = new WebSocket(wsUrl);
+            } catch(e) {
+                isConnecting = false;
+                console.error('Failed to create WebSocket:', e);
+                return;
+            }
 
             ws.onopen = () => {
                 console.log('WebSocket connected');
+                hasEverConnected = true;
                 updateStatus(true);
                 reconnectInterval = 1000;
+                isConnecting = false;
+                try {
+                    sessionStorage.setItem('ws_connected', 'true');
+                    sessionStorage.setItem('ws_last_connected', Date.now().toString());
+                } catch(e) {}
             };
 
             ws.onmessage = (event) => {
                 try {
                     const data = JSON.parse(event.data);
                     handleMessage(data);
+                    
+                    // Update uptime from health or snapshot messages
+                    if (data.type === 'health' && data.data && data.data.uptime_seconds !== undefined) {
+                        uptimeSeconds = Math.floor(data.data.uptime_seconds);
+                        document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
+                    }
+                    if (data.type === 'snapshot' && data.data && data.data.gauges && data.data.gauges['engine_uptime_seconds'] !== undefined) {
+                        uptimeSeconds = Math.floor(data.data.gauges['engine_uptime_seconds']);
+                        document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
+                    }
                 } catch (e) {
                     console.error('Failed to parse message:', e);
                 }
@@ -478,8 +769,20 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
-                updateStatus(false);
-                scheduleReconnect();
+                // Only show disconnected if we had ever successfully connected
+                // This prevents "Disconnected" flash on initial page load
+                if (hasEverConnected) {
+                    updateStatus(false);
+                }
+                isConnecting = false;
+                try {
+                    sessionStorage.setItem('ws_connected', 'false');
+                    sessionStorage.setItem('ws_last_disconnected', Date.now().toString());
+                } catch(e) {}
+                // Add delay before reconnecting
+                setTimeout(() => {
+                    scheduleReconnect();
+                }, 500);
             };
 
             ws.onerror = (error) => {
@@ -488,7 +791,16 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
             };
         }
 
-        // Reconnection logic with exponential backoff
+        function formatUptime(seconds) {
+            if (!seconds || seconds < 0) return '0s';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
         function scheduleReconnect() {
             setTimeout(() => {
                 console.log(`Reconnecting in ${reconnectInterval}ms...`);
@@ -514,10 +826,6 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         // Handle incoming WebSocket messages
         let eventCount = 0;
         let matchCount = 0;
-        let actionSuccessCount = 0;
-        let actionErrorCount = 0;
-        let lastSecondEvents = 0;
-        let lastSecondMatches = 0;
 
         function handleMessage(data) {
             switch(data.type) {
@@ -537,6 +845,7 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
                     } else {
                         actionErrorCount++;
                     }
+                    persistMetrics();
                     addEventToLog('action', `Action: ${data.data.action_name}`,
                         data.data.success ? 'success' : 'error');
                     break;
@@ -628,15 +937,19 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 
             document.getElementById('actionsCount').textContent =
                 actionSuccessCount + actionErrorCount;
-            actionsChart.data.datasets[0].data = [actionSuccessCount, actionErrorCount];
-            actionsChart.update('none');
+            if (actionsChart) {
+                actionsChart.data.datasets[0].data = [actionSuccessCount, actionErrorCount];
+                actionsChart.update('none');
+            }
 
             lastSecondEvents = 0;
             lastSecondMatches = 0;
 
-            const uptime = document.getElementById('uptime');
-            const current = parseInt(uptime.textContent) || 0;
-            uptime.textContent = (current + 1) + 's';
+            uptimeSeconds++;
+            document.getElementById('uptime').textContent = formatUptime(uptimeSeconds);
+            
+            // Persist metrics periodically
+            persistMetrics();
         }, 1000);
 
         // Initialize
@@ -655,14 +968,869 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
+/// Automations management page HTML
+const AUTOMATIONS_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WinEventEngine - Automations</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 1rem 2rem; border-bottom: 1px solid #334155; display: flex; align-items: center; gap: 1rem; }
+        .header h1 { font-size: 1.5rem; color: #f8fafc; display: flex; align-items: center; gap: 0.5rem; margin-right: auto; }
+        .header .connection-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
+        .header .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; transition: background 0.3s; }
+        .header .status-dot.connected { background: #22c55e; }
+        .nav { display: flex; gap: 0.5rem; }
+        .nav a { color: #94a3b8; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.875rem; transition: all 0.2s; }
+        .nav a:hover, .nav a.active { background: #3b82f6; color: #fff; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+        .page-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; }
+        .page-header h2 { font-size: 1.5rem; }
+        .btn { background: #3b82f6; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-size: 0.875rem; }
+        .btn:hover { background: #2563eb; }
+        .btn-danger { background: #ef4444; }
+        .btn-danger:hover { background: #dc2626; }
+        .btn-success { background: #22c55e; }
+        .btn-success:hover { background: #16a34a; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 1rem; text-align: left; border-bottom: 1px solid #334155; }
+        th { background: #1e293b; font-weight: 600; color: #94a3b8; }
+        tr:hover { background: #1e293b; }
+        .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 0.5rem; }
+        .status.enabled { background: #22c55e; }
+        .status.disabled { background: #ef4444; }
+        .actions { display: flex; gap: 0.5rem; }
+        .actions button { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+        .empty-state { text-align: center; padding: 4rem; color: #64748b; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>WinEventEngine <span class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span></h1>
+        <nav class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/automations" class="active">Automations</a>
+            <a href="/test">Test Rules</a>
+            <a href="/import-export">Import/Export</a>
+        </nav>
+    </div>
+    <div class="container">
+        <div class="page-header">
+            <h2>Automations</h2>
+            <a href="/automations/new" class="btn">+ New Automation</a>
+        </div>
+        <table id="rulesTable">
+            <thead>
+                <tr>
+                    <th>Status</th>
+                    <th>Name</th>
+                    <th>Trigger</th>
+                    <th>Action</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody id="rulesBody"></tbody>
+        </table>
+        <div class="empty-state" id="emptyState">No automations found. Create one to get started.</div>
+    </div>
+    <script>
+        async function loadRules() {
+            const response = await fetch('/api/rules');
+            const data = await response.json();
+            const tbody = document.getElementById('rulesBody');
+            const emptyState = document.getElementById('emptyState');
+            
+            if (data.success && data.data && data.data.length > 0) {
+                tbody.innerHTML = data.data.map(rule => `
+                    <tr>
+                        <td><span class="status ${rule.enabled ? 'enabled' : 'disabled'}"></span></td>
+                        <td>${rule.name}</td>
+                        <td>${rule.trigger.type}</td>
+                        <td>${rule.action.type}</td>
+                        <td class="actions">
+                            <button class="btn" onclick="toggleRule(this)" data-name="${rule.name.replace(/"/g, '&quot;')}" data-enabled="${!rule.enabled}">${rule.enabled ? 'Disable' : 'Enable'}</button>
+                            <a href="/automations/new?name=${encodeURIComponent(rule.name)}" class="btn">Edit</a>
+                            <button class="btn btn-danger" onclick="deleteRule(this)" data-name="${rule.name.replace(/"/g, '&quot;')}">Delete</button>
+                        </td>
+                    </tr>
+                `).join('');
+                emptyState.style.display = 'none';
+            } else {
+                tbody.innerHTML = '';
+                emptyState.style.display = 'block';
+            }
+        }
+        
+        async function toggleRule(btn) {
+            const name = btn.dataset.name;
+            const enabled = btn.dataset.enabled === 'true';
+            await fetch(`/api/rules/${encodeURIComponent(name)}/enable`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({enabled})
+            });
+            loadRules();
+        }
+        
+        async function deleteRule(btn) {
+            const name = btn.dataset.name;
+            if (confirm(`Delete automation "${name}"?`)) {
+                await fetch(`/api/rules/${encodeURIComponent(name)}`, {method: 'DELETE'});
+                loadRules();
+            }
+        }
+        
+        loadRules();
+        
+        // WebSocket connection for status
+        let ws = null;
+        let reconnectInterval = 1000;
+        const maxReconnectInterval = 30000;
+        let isConnecting = false;
+
+        function connect() {
+            if (isConnecting) { console.log('Already connecting, skipping...'); return; }
+            try { if (sessionStorage.getItem('ws_connected') === 'true' && ws && ws.readyState === WebSocket.OPEN) { console.log('WebSocket already connected'); return; } } catch(e) {}
+            isConnecting = true;
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            try { ws = new WebSocket(wsUrl); } catch(e) { isConnecting = false; console.error('Failed to create WebSocket:', e); return; }
+            ws.onopen = () => { console.log('WebSocket connected'); updateStatus(true); reconnectInterval = 1000; isConnecting = false; try { sessionStorage.setItem('ws_connected', 'true'); } catch(e) {} };
+            ws.onmessage = (event) => { try { const data = JSON.parse(event.data); } catch (e) { console.error('Failed to parse message:', e); } };
+            ws.onclose = () => { console.log('WebSocket disconnected'); updateStatus(false); isConnecting = false; try { sessionStorage.setItem('ws_connected', 'false'); } catch(e) {} setTimeout(() => { scheduleReconnect(); }, 500); };
+            ws.onerror = (error) => { console.error('WebSocket error:', error); ws.close(); };
+        }
+
+        function scheduleReconnect() {
+            if (reconnectInterval > maxReconnectInterval) reconnectInterval = maxReconnectInterval;
+            console.log(`Reconnecting in ${reconnectInterval}ms...`);
+            reconnectInterval = Math.min(reconnectInterval * 2, maxReconnectInterval);
+            connect();
+        }
+
+        function updateStatus(connected) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            if (connected) { dot.classList.add('connected'); text.textContent = 'Connected'; } 
+            else { dot.classList.remove('connected'); text.textContent = 'Disconnected'; }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => { connect(); });
+
+        window.addEventListener('beforeunload', () => {
+            if (ws) {
+                ws.close();
+            }
+        });
+    </script>
+</body>
+</html>"#;
+
+/// Automation editor page HTML
+const AUTOMATION_EDITOR_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WinEventEngine - Create Automation</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 1rem 2rem; border-bottom: 1px solid #334155; display: flex; align-items: center; gap: 1rem; }
+        .header h1 { font-size: 1.5rem; color: #f8fafc; display: flex; align-items: center; gap: 0.5rem; margin-right: auto; }
+        .header .connection-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
+        .header .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; transition: background 0.3s; }
+        .header .status-dot.connected { background: #22c55e; }
+        .nav { display: flex; gap: 0.5rem; }
+        .nav a { color: #94a3b8; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.875rem; transition: all 0.2s; }
+        .nav a:hover, .nav a.active { background: #3b82f6; color: #fff; }
+        .container { max-width: 800px; margin: 0 auto; padding: 2rem; }
+        .form-group { margin-bottom: 1.5rem; }
+        label { display: block; margin-bottom: 0.5rem; color: #94a3b8; font-size: 0.875rem; }
+        input, select, textarea { width: 100%; padding: 0.75rem; background: #1e293b; border: 1px solid #334155; border-radius: 6px; color: #f8fafc; font-size: 1rem; }
+        input:focus, select:focus, textarea:focus { outline: none; border-color: #3b82f6; }
+        .btn { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; cursor: pointer; font-size: 1rem; margin-right: 1rem; text-decoration: none; display: inline-block; }
+        .btn:hover { background: #2563eb; }
+        .btn-secondary { background: #334155; }
+        .btn-secondary:hover { background: #475569; }
+        .section { background: #1e293b; padding: 1.5rem; border-radius: 12px; margin-bottom: 1.5rem; }
+        .section h3 { margin-bottom: 1rem; color: #f8fafc; }
+        .hint { font-size: 0.75rem; color: #64748b; margin-top: 0.25rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>WinEventEngine <span class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span></h1>
+        <nav class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/automations" class="active">Automations</a>
+            <a href="/test">Test Rules</a>
+            <a href="/import-export">Import/Export</a>
+        </nav>
+    </div>
+    <div class="container">
+        <form id="ruleForm">
+            <div class="section">
+                <h3 id="pageTitle">Create Automation</h3>
+                <h3>Basic Info</h3>
+                <div class="form-group">
+                    <label>Name</label>
+                    <input type="text" name="name" id="name" required placeholder="my_automation">
+                </div>
+                <div class="form-group">
+                    <label>Description (optional)</label>
+                    <input type="text" name="description" id="description" placeholder="What does this automation do?">
+                </div>
+            </div>
+            
+            <div class="section">
+                <h3>Trigger (When)</h3>
+                <div class="form-group">
+                    <label>Event Type</label>
+                    <select name="triggerType" id="triggerType" onchange="updateFields()">
+                        <option value="file_created">File Created</option>
+                        <option value="file_modified">File Modified</option>
+                        <option value="file_deleted">File Deleted</option>
+                        <option value="window_focused">Window Focused</option>
+                        <option value="window_unfocused">Window Unfocused</option>
+                        <option value="window_created">Window Created</option>
+                        <option value="process_started">Process Started</option>
+                        <option value="process_stopped">Process Stopped</option>
+                        <option value="registry_changed">Registry Changed</option>
+                        <option value="timer">Timer</option>
+                    </select>
+                </div>
+                <div class="form-group" id="pathGroup" style="display:none">
+                    <label>Watch Path</label>
+                    <input type="text" name="path" id="path" placeholder="C:\Users\You\Folder">
+                    <div class="hint">Directory path to watch for file events</div>
+                </div>
+                <div class="form-group" id="patternGroup">
+                    <label>File Pattern (optional)</label>
+                    <input type="text" name="pattern" id="pattern" placeholder="*.txt, *.log, etc.">
+                    <div class="hint">Glob pattern to match file paths</div>
+                </div>
+                <div class="form-group" id="titleContainsGroup" style="display:none">
+                    <label>Window Title Contains</label>
+                    <input type="text" name="titleContains" id="titleContains" placeholder="Part of window title">
+                </div>
+                <div class="form-group" id="processNameGroup" style="display:none">
+                    <label>Process Name (optional)</label>
+                    <input type="text" name="processName" id="processName" placeholder="chrome.exe, notepad.exe, etc.">
+                    <div class="hint">Additional filter by process name. Leave empty to match any process.</div>
+                </div>
+                <div class="form-group" id="timerGroup" style="display:none">
+                    <label>Interval (seconds)</label>
+                    <input type="number" name="intervalSeconds" id="intervalSeconds" value="60" min="1">
+                </div>
+                <div class="form-group" id="valueNameGroup" style="display:none">
+                    <label>Registry Value Name (optional)</label>
+                    <input type="text" name="valueName" id="valueName" placeholder="ValueName">
+                </div>
+            </div>
+            
+            <div class="section">
+                <h3>Action (Then)</h3>
+                <div class="form-group">
+                    <label>Action Type</label>
+                    <select name="actionType" id="actionType" onchange="updateFields()">
+                        <option value="log">Log Message</option>
+                        <option value="execute">Execute Command</option>
+                        <option value="powershell">PowerShell Script</option>
+                        <option value="notify">Show Notification</option>
+                        <option value="http_request">HTTP Request</option>
+                        <option value="media">Media Control</option>
+                    </select>
+                </div>
+                <div id="logFields">
+                    <div class="form-group">
+                        <label>Message</label>
+                        <input type="text" name="logMessage" id="logMessage" placeholder="Log message to write">
+                    </div>
+                    <div class="form-group">
+                        <label>Level</label>
+                        <select name="logLevel" id="logLevel">
+                            <option value="debug">Debug</option>
+                            <option value="info" selected>Info</option>
+                            <option value="warn">Warning</option>
+                            <option value="error">Error</option>
+                        </select>
+                    </div>
+                </div>
+                <div id="executeFields" style="display:none">
+                    <div class="form-group">
+                        <label>Command</label>
+                        <input type="text" name="executeCommand" id="executeCommand" placeholder="echo, cmd, etc.">
+                    </div>
+                    <div class="form-group">
+                        <label>Arguments</label>
+                        <input type="text" name="executeArgs" id="executeArgs" placeholder="arg1 arg2 arg3">
+                    </div>
+                    <div class="form-group">
+                        <label>Working Directory (optional)</label>
+                        <input type="text" name="executeWorkingDir" id="executeWorkingDir" placeholder="C:\path\to\dir">
+                    </div>
+                </div>
+                <div id="powershellFields" style="display:none">
+                    <div class="form-group">
+                        <label>Script</label>
+                        <textarea name="powershellScript" id="powershellScript" rows="4" placeholder="Write-Host 'Hello World'"></textarea>
+                    </div>
+                    <div class="form-group">
+                        <label>Working Directory (optional)</label>
+                        <input type="text" name="powershellWorkingDir" id="powershellWorkingDir" placeholder="C:\path\to\dir">
+                    </div>
+                </div>
+                <div id="notifyFields" style="display:none">
+                    <div class="form-group">
+                        <label>Title</label>
+                        <input type="text" name="notifyTitle" id="notifyTitle" placeholder="Notification title">
+                    </div>
+                    <div class="form-group">
+                        <label>Message</label>
+                        <input type="text" name="notifyMessage" id="notifyMessage" placeholder="Notification message">
+                    </div>
+                </div>
+                <div id="httpRequestFields" style="display:none">
+                    <div class="form-group">
+                        <label>URL</label>
+                        <input type="text" name="httpUrl" id="httpUrl" placeholder="https://example.com/webhook">
+                    </div>
+                    <div class="form-group">
+                        <label>Method</label>
+                        <select name="httpMethod" id="httpMethod">
+                            <option value="GET">GET</option>
+                            <option value="POST" selected>POST</option>
+                            <option value="PUT">PUT</option>
+                            <option value="DELETE">DELETE</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Body (optional)</label>
+                        <textarea name="httpBody" id="httpBody" rows="3" placeholder='{"key": "value"}'></textarea>
+                    </div>
+                </div>
+                <div id="mediaFields" style="display:none">
+                    <div class="form-group">
+                        <label>Command</label>
+                        <select name="mediaCommand" id="mediaCommand">
+                            <option value="play_pause">Play / Pause (toggle)</option>
+                            <option value="stop">Stop</option>
+                            <option value="next">Next Track</option>
+                            <option value="previous">Previous Track</option>
+                            <option value="volume_up">Volume Up</option>
+                            <option value="volume_down">Volume Down</option>
+                            <option value="mute">Mute / Unmute (toggle)</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" name="enabled" id="enabled" checked> Enable this automation
+                </label>
+            </div>
+            
+            <button type="submit" class="btn" id="submitBtn">Save Automation</button>
+            <a href="/automations" class="btn btn-secondary">Cancel</a>
+        </form>
+    </div>
+    <script>
+        function updateFields() {
+            const triggerType = document.getElementById("triggerType").value;
+            const actionType = document.getElementById("actionType").value;
+            
+            // Show/hide trigger fields
+            document.getElementById("pathGroup").style.display = triggerType.startsWith("file") ? "block" : "none";
+            document.getElementById("patternGroup").style.display = triggerType.startsWith("file") ? "block" : "none";
+            document.getElementById("titleContainsGroup").style.display = (triggerType === "window_focused" || triggerType === "window_unfocused") ? "block" : "none";
+            document.getElementById("processNameGroup").style.display = 
+                (triggerType === "process_started" || triggerType === "process_stopped" || triggerType === "window_focused" || triggerType === "window_unfocused") ? "block" : "none";
+            document.getElementById("timerGroup").style.display = triggerType === "timer" ? "block" : "none";
+            document.getElementById("valueNameGroup").style.display = triggerType === "registry_changed" ? "block" : "none";
+            
+            // Show/hide action fields
+            document.getElementById("logFields").style.display = actionType === "log" ? "block" : "none";
+            document.getElementById("executeFields").style.display = actionType === "execute" ? "block" : "none";
+            document.getElementById("powershellFields").style.display = actionType === "powershell" ? "block" : "none";
+            document.getElementById("notifyFields").style.display = actionType === "notify" ? "block" : "none";
+            document.getElementById("httpRequestFields").style.display = actionType === "http_request" ? "block" : "none";
+            document.getElementById("mediaFields").style.display = actionType === "media" ? "block" : "none";
+        }
+        
+        document.getElementById("ruleForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            
+            const triggerType = formData.get("triggerType");
+            let trigger = { type: triggerType };
+            if (formData.get("pattern")) trigger.pattern = formData.get("pattern");
+            if (formData.get("path")) trigger.path = formData.get("path");
+            if (formData.get("titleContains")) trigger.title_contains = formData.get("titleContains");
+            if (formData.get("processName")) trigger.process_name = formData.get("processName");
+            if (formData.get("intervalSeconds")) trigger.interval_seconds = parseInt(formData.get("intervalSeconds"));
+            if (formData.get("valueName")) trigger.value_name = formData.get("valueName");
+            
+            const actionType = formData.get("actionType");
+            let action = { type: actionType };
+            if (actionType === "log") {
+                action.message = formData.get("logMessage");
+                action.level = formData.get("logLevel");
+            } else if (actionType === "execute") {
+                action.command = formData.get("executeCommand");
+                action.args = formData.get("executeArgs").split(" ").filter(a => a);
+            } else if (actionType === "powershell") {
+                action.script = formData.get("powershellScript");
+            } else if (actionType === "notify") {
+                action.title = formData.get("notifyTitle");
+                action.message = formData.get("notifyMessage");
+            } else if (actionType === "http_request") {
+                action.url = formData.get("httpUrl");
+                action.method = formData.get("httpMethod");
+                action.body = formData.get("httpBody");
+                action.headers = {};
+            } else if (actionType === "media") {
+                action.command = formData.get("mediaCommand");
+            }
+            
+            const rule = {
+                name: formData.get("name"),
+                description: formData.get("description") || null,
+                trigger,
+                action,
+                enabled: formData.get("enabled") === "on"
+            };
+            
+            const response = await fetch("/api/rules", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify(rule)
+            });
+            
+            const data = await response.json();
+            if (data.success) {
+                window.location.href = "/automations";
+            } else {
+                alert("Error: " + (data.error || "Unknown error"));
+            }
+        });
+        
+        updateFields();
+        
+        // WebSocket connection for status
+        let ws = null;
+        let reconnectInterval = 1000;
+        const maxReconnectInterval = 30000;
+        let isConnecting = false;
+
+        function connect() {
+            if (isConnecting) { console.log('Already connecting, skipping...'); return; }
+            try { if (sessionStorage.getItem('ws_connected') === 'true' && ws && ws.readyState === WebSocket.OPEN) { console.log('WebSocket already connected'); return; } } catch(e) {}
+            isConnecting = true;
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            try { ws = new WebSocket(wsUrl); } catch(e) { isConnecting = false; console.error('Failed to create WebSocket:', e); return; }
+            ws.onopen = () => { console.log('WebSocket connected'); updateStatus(true); reconnectInterval = 1000; isConnecting = false; try { sessionStorage.setItem('ws_connected', 'true'); } catch(e) {} };
+            ws.onmessage = (event) => { try { const data = JSON.parse(event.data); } catch (e) { console.error('Failed to parse message:', e); } };
+            ws.onclose = () => { console.log('WebSocket disconnected'); updateStatus(false); isConnecting = false; try { sessionStorage.setItem('ws_connected', 'false'); } catch(e) {} setTimeout(() => { scheduleReconnect(); }, 500); };
+            ws.onerror = (error) => { console.error('WebSocket error:', error); ws.close(); };
+        }
+
+        function scheduleReconnect() {
+            if (reconnectInterval > maxReconnectInterval) reconnectInterval = maxReconnectInterval;
+            console.log(`Reconnecting in ${reconnectInterval}ms...`);
+            reconnectInterval = Math.min(reconnectInterval * 2, maxReconnectInterval);
+            connect();
+        }
+
+        function updateStatus(connected) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            if (connected) { dot.classList.add('connected'); text.textContent = 'Connected'; } 
+            else { dot.classList.remove('connected'); text.textContent = 'Disconnected'; }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            connect();
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (ws) {
+                ws.close();
+            }
+        });
+    </script>
+</body>
+</html>"#;
+
+/// Test rule page HTML
+const TEST_RULE_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WinEventEngine - Test Rules</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 1rem 2rem; border-bottom: 1px solid #334155; display: flex; align-items: center; gap: 1rem; }
+        .header h1 { font-size: 1.5rem; color: #f8fafc; display: flex; align-items: center; gap: 0.5rem; margin-right: auto; }
+        .header .connection-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
+        .header .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; transition: background 0.3s; }
+        .header .status-dot.connected { background: #22c55e; }
+        .nav { display: flex; gap: 0.5rem; }
+        .nav a { color: #94a3b8; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.875rem; transition: all 0.2s; }
+        .nav a:hover, .nav a.active { background: #3b82f6; color: #fff; }
+        .container { max-width: 1000px; margin: 0 auto; padding: 2rem; }
+        .section { background: #1e293b; padding: 1.5rem; border-radius: 12px; margin-bottom: 1.5rem; }
+        .section h3 { margin-bottom: 1rem; color: #f8fafc; }
+        select, textarea { width: 100%; padding: 0.75rem; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #f8fafc; font-family: monospace; font-size: 0.875rem; }
+        textarea { min-height: 200px; resize: vertical; }
+        .btn { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; cursor: pointer; font-size: 1rem; }
+        .btn:hover { background: #2563eb; }
+        .result { padding: 1rem; border-radius: 6px; margin-top: 1rem; }
+        .result.match { background: #22c55e20; border: 1px solid #22c55e; color: #22c55e; }
+        .result.no-match { background: #ef444420; border: 1px solid #ef4444; color: #ef4444; }
+        .result.error { background: #f59e0b20; border: 1px solid #f59e0b; color: #f59e0b; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>WinEventEngine <span class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span></h1>
+        <nav class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/automations">Automations</a>
+            <a href="/test" class="active">Test Rules</a>
+            <a href="/import-export">Import/Export</a>
+        </nav>
+    </div>
+    <div class="container">
+        <div class="section">
+            <h3>Select Rule to Test</h3>
+            <select id="ruleSelect" onchange="updateSampleEvent()">
+                <option value="">-- Select a rule --</option>
+            </select>
+        </div>
+        
+        <div class="section">
+            <h3>Event JSON</h3>
+            <p style="color: #64748b; margin-bottom: 1rem; font-size: 0.875rem;">Paste an event JSON to test if it matches the rule</p>
+            <textarea id="eventJson" placeholder='{"id": "...", "timestamp": "...", "kind": {"FileCreated": {"path": "C:/test.txt"}}, "source": "file_watcher", "metadata": {}}'></textarea>
+        </div>
+        
+        <button class="btn" onclick="testRule()">Test Rule</button>
+        
+        <div id="result" style="display: none"></div>
+    </div>
+    
+    <script>
+        async function loadRules() {
+            const response = await fetch('/api/rules');
+            const data = await response.json();
+            const select = document.getElementById('ruleSelect');
+            
+            if (data.success && data.data) {
+                data.data.forEach(rule => {
+                    const option = document.createElement('option');
+                    option.value = JSON.stringify(rule);
+                    option.textContent = rule.name + ' (' + rule.trigger.type + ')';
+                    select.appendChild(option);
+                });
+            }
+        }
+        
+        function updateSampleEvent() {
+            const ruleSelect = document.getElementById('ruleSelect');
+            const eventJson = document.getElementById('eventJson');
+            
+            if (!ruleSelect.value) return;
+            
+            const rule = JSON.parse(ruleSelect.value);
+            const triggerType = rule.trigger.type;
+            
+            let sampleEvent = {
+                id: "00000000-0000-0000-0000-000000000000",
+                timestamp: "2024-01-01T00:00:00Z",
+                source: "test",
+                metadata: {}
+            };
+            
+            switch(triggerType) {
+                case 'file_created':
+                case 'file_modified':
+                case 'file_deleted':
+                    sampleEvent.kind = { FileCreated: { path: "C:/test.txt" } };
+                    break;
+                case 'window_focused':
+                case 'window_unfocused':
+                case 'window_created':
+                    sampleEvent.kind = { WindowFocused: { hwnd: 12345, title: "Notepad" } };
+                    break;
+                case 'process_started':
+                case 'process_stopped':
+                    sampleEvent.kind = { ProcessStarted: { pid: 1234, name: "notepad.exe", path: "C:/Windows/notepad.exe" } };
+                    break;
+                case 'registry_changed':
+                    sampleEvent.kind = { RegistryChanged: { root: "HKCU", key: "Software\\Test", value_name: "TestValue" } };
+                    break;
+                case 'timer':
+                    sampleEvent.kind = { TimerTick: {} };
+                    break;
+            }
+            
+            eventJson.value = JSON.stringify(sampleEvent, null, 2);
+        }
+        
+        async function testRule() {
+            const ruleSelect = document.getElementById('ruleSelect');
+            const eventJson = document.getElementById('eventJson');
+            const result = document.getElementById('result');
+            
+            if (!ruleSelect.value || !eventJson.value) {
+                result.className = 'result error';
+                result.textContent = 'Please select a rule and provide event JSON';
+                result.style.display = 'block';
+                return;
+            }
+            
+            const rule = JSON.parse(ruleSelect.value);
+            const event = eventJson.value;
+            
+            const response = await fetch('/api/rules/test', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ rule, event })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                if (data.data) {
+                    result.className = 'result match';
+                    result.textContent = '✓ Rule MATCHED the event!';
+                } else {
+                    result.className = 'result no-match';
+                    result.textContent = '✗ Rule did NOT match the event';
+                }
+            } else {
+                result.className = 'result error';
+                result.textContent = 'Error: ' + (data.error || 'Unknown error');
+            }
+            result.style.display = 'block';
+        }
+        
+        loadRules();
+        
+        // WebSocket connection for status
+        let ws;
+        let reconnectInterval = 1000;
+        const maxReconnectInterval = 30000;
+
+        function connect() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                updateStatus(true);
+                reconnectInterval = 1000;
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                } catch (e) {
+                    console.error('Failed to parse message:', e);
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                updateStatus(false);
+                scheduleReconnect();
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                ws.close();
+            };
+        }
+
+        function scheduleReconnect() {
+            setTimeout(() => {
+                console.log(`Reconnecting in ${reconnectInterval}ms...`);
+                reconnectInterval = Math.min(reconnectInterval * 2, maxReconnectInterval);
+                connect();
+            }, reconnectInterval);
+        }
+
+        function updateStatus(connected) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+
+            if (connected) {
+                dot.classList.add('connected');
+                text.textContent = 'Connected';
+            } else {
+                dot.classList.remove('connected');
+                text.textContent = 'Disconnected';
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            connect();
+        });
+
+        window.addEventListener('beforeunload', () => {
+            if (ws) {
+                ws.close();
+            }
+        });
+    </script>
+</body>
+</html>"#;
+
+/// Import/Export page HTML
+const IMPORT_EXPORT_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WinEventEngine - Import/Export</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+        .header { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); padding: 1rem 2rem; border-bottom: 1px solid #334155; display: flex; align-items: center; gap: 1rem; }
+        .header h1 { font-size: 1.5rem; color: #f8fafc; display: flex; align-items: center; gap: 0.5rem; margin-right: auto; }
+        .header .connection-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
+        .header .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; transition: background 0.3s; }
+        .header .status-dot.connected { background: #22c55e; }
+        .nav { display: flex; gap: 0.5rem; }
+        .nav a { color: #94a3b8; text-decoration: none; padding: 0.5rem 1rem; border-radius: 6px; font-size: 0.875rem; transition: all 0.2s; }
+        .nav a:hover, .nav a.active { background: #3b82f6; color: #fff; }
+        .container { max-width: 800px; margin: 0 auto; padding: 2rem; }
+        .section { background: #1e293b; padding: 1.5rem; border-radius: 12px; margin-bottom: 1.5rem; }
+        .section h3 { margin-bottom: 1rem; color: #f8fafc; }
+        textarea { width: 100%; padding: 0.75rem; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #f8fafc; font-family: monospace; font-size: 0.875rem; min-height: 300px; }
+        .btn { background: #3b82f6; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; cursor: pointer; font-size: 1rem; margin-right: 1rem; }
+        .btn:hover { background: #2563eb; }
+        .btn-success { background: #22c55e; }
+        .btn-success:hover { background: #16a34a; }
+        .message { padding: 1rem; border-radius: 6px; margin-top: 1rem; }
+        .message.success { background: #22c55e20; border: 1px solid #22c55e; color: #22c55e; }
+        .message.error { background: #ef444420; border: 1px solid #ef4444; color: #ef4444; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>WinEventEngine <span class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span></h1>
+        <nav class="nav">
+            <a href="/">Dashboard</a>
+            <a href="/automations">Automations</a>
+            <a href="/test">Test Rules</a>
+            <a href="/import-export" class="active">Import/Export</a>
+        </nav>
+    </div>
+    <div class="container">
+        <div class="section">
+            <h3>Export Automations</h3>
+            <p style="color: #64748b; margin-bottom: 1rem;">Download all your automations as JSON.</p>
+            <button class="btn btn-success" onclick="exportRules()">Export to JSON</button>
+            <textarea id="exportArea" readonly placeholder="Exported JSON will appear here..."></textarea>
+        </div>
+        
+        <div class="section">
+            <h3>Import Automations</h3>
+            <p style="color: #64748b; margin-bottom: 1rem;">Paste JSON to import automations. Existing rules with the same name will be skipped.</p>
+            <textarea id="importArea" placeholder="Paste JSON array of rules here..."></textarea>
+            <button class="btn" onclick="importRules()" style="margin-top: 1rem;">Import</button>
+            <div id="importMessage" style="display: none"></div>
+        </div>
+    </div>
+    
+    <script>
+        async function exportRules() {
+            const response = await fetch('/api/rules/export');
+            const text = await response.text();
+            document.getElementById('exportArea').value = text;
+        }
+        
+        async function importRules() {
+            const content = document.getElementById('importArea').value;
+            const message = document.getElementById('importMessage');
+            
+            const response = await fetch('/api/rules/import', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ content })
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+                message.className = 'message success';
+                message.textContent = `Successfully imported ${data.data} rules!`;
+            } else {
+                message.className = 'message error';
+                message.textContent = 'Error: ' + (data.error || 'Unknown error');
+            }
+            message.style.display = 'block';
+        }
+        
+        // WebSocket connection for status
+        let ws = null;
+        let reconnectInterval = 1000;
+        const maxReconnectInterval = 30000;
+        let isConnecting = false;
+
+        function connect() {
+            if (isConnecting) { console.log('Already connecting, skipping...'); return; }
+            try { if (sessionStorage.getItem('ws_connected') === 'true' && ws && ws.readyState === WebSocket.OPEN) { console.log('WebSocket already connected'); return; } } catch(e) {}
+            isConnecting = true;
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            try { ws = new WebSocket(wsUrl); } catch(e) { isConnecting = false; console.error('Failed to create WebSocket:', e); return; }
+            ws.onopen = () => { console.log('WebSocket connected'); updateStatus(true); reconnectInterval = 1000; isConnecting = false; try { sessionStorage.setItem('ws_connected', 'true'); } catch(e) {} };
+            ws.onmessage = (event) => { try { const data = JSON.parse(event.data); } catch (e) { console.error('Failed to parse message:', e); } };
+            ws.onclose = () => { console.log('WebSocket disconnected'); updateStatus(false); isConnecting = false; try { sessionStorage.setItem('ws_connected', 'false'); } catch(e) {} setTimeout(() => { scheduleReconnect(); }, 500); };
+            ws.onerror = (error) => { console.error('WebSocket error:', error); ws.close(); };
+        }
+
+        function scheduleReconnect() {
+            if (reconnectInterval > maxReconnectInterval) reconnectInterval = maxReconnectInterval;
+            console.log(`Reconnecting in ${reconnectInterval}ms...`);
+            reconnectInterval = Math.min(reconnectInterval * 2, maxReconnectInterval);
+            connect();
+        }
+
+        function updateStatus(connected) {
+            const dot = document.getElementById('statusDot');
+            const text = document.getElementById('statusText');
+            if (connected) { dot.classList.add('connected'); text.textContent = 'Connected'; } 
+            else { dot.classList.remove('connected'); text.textContent = 'Disconnected'; }
+        }
+
+        document.addEventListener('DOMContentLoaded', () => { connect(); });
+
+        window.addEventListener('beforeunload', () => { if (ws) { ws.close(); } });
+    </script>
+</body>
+</html>"#;
+
 /// Prometheus format metrics handler
-async fn metrics_handler(State(collector): State<Arc<MetricsCollector>>) -> String {
-    collector.get_prometheus_format()
+async fn metrics_handler(State(state): State<Arc<ApiState>>) -> String {
+    state.metrics.get_prometheus_format()
 }
 
 /// JSON snapshot handler
-async fn snapshot_handler(State(collector): State<Arc<MetricsCollector>>) -> Json<MetricsSnapshot> {
-    Json(collector.get_snapshot())
+async fn snapshot_handler(State(state): State<Arc<ApiState>>) -> Json<MetricsSnapshot> {
+    Json(state.metrics.get_snapshot())
 }
 
 /// Health check handler
@@ -671,6 +1839,154 @@ async fn health_handler() -> Json<HealthResponse> {
         status: "healthy".to_string(),
         timestamp: chrono::Utc::now(),
     })
+}
+
+async fn rules_list_handler(State(state): State<Arc<ApiState>>) -> Json<ApiResponse<Vec<serde_json::Value>>> {
+    if let Some(manager) = &state.rule_manager {
+        let rules = manager.get_rules();
+        Json(ApiResponse::success(rules))
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_get_handler(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Json<ApiResponse<serde_json::Value>> {
+    if let Some(manager) = &state.rule_manager {
+        let rules = manager.get_rules();
+        if let Some(rule) = rules.into_iter().find(|r| r.get("name").and_then(|v| v.as_str()) == Some(&name)) {
+            Json(ApiResponse::success(rule))
+        } else {
+            Json(ApiResponse::error(&format!("Rule '{}' not found", name)))
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_create_handler(State(state): State<Arc<ApiState>>, Json(rule): Json<serde_json::Value>) -> Json<ApiResponse<serde_json::Value>> {
+    if let Some(manager) = &state.rule_manager {
+        match manager.add_rule(rule) {
+            Ok(created) => Json(ApiResponse::success(created)),
+            Err(e) => Json(ApiResponse::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_update_handler(State(state): State<Arc<ApiState>>, Path(name): Path<String>, Json(rule): Json<serde_json::Value>) -> Json<ApiResponse<serde_json::Value>> {
+    if let Some(manager) = &state.rule_manager {
+        match manager.update_rule(&name, rule) {
+            Ok(updated) => Json(ApiResponse::success(updated)),
+            Err(e) => Json(ApiResponse::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_delete_handler(State(state): State<Arc<ApiState>>, Path(name): Path<String>) -> Json<ApiResponse<()>> {
+    if let Some(manager) = &state.rule_manager {
+        match manager.delete_rule(&name) {
+            Ok(()) => Json(ApiResponse::success(())),
+            Err(e) => Json(ApiResponse::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_enable_handler(State(state): State<Arc<ApiState>>, Path(name): Path<String>, Json(payload): Json<EnableRequest>) -> Json<ApiResponse<()>> {
+    if let Some(manager) = &state.rule_manager {
+        match manager.enable_rule(&name, payload.enabled) {
+            Ok(()) => Json(ApiResponse::success(())),
+            Err(e) => Json(ApiResponse::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_validate_handler(State(state): State<Arc<ApiState>>, Json(rule): Json<serde_json::Value>) -> Json<ApiResponse<()>> {
+    if let Some(manager) = &state.rule_manager {
+        match manager.validate_rule(rule) {
+            Ok(()) => Json(ApiResponse::success(())),
+            Err(e) => Json(ApiResponse::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_test_handler(State(state): State<Arc<ApiState>>, Json(payload): Json<TestRuleRequest>) -> Json<ApiResponse<bool>> {
+    if let Some(manager) = &state.rule_manager {
+        match manager.test_rule_match(payload.rule, &payload.event) {
+            Ok(matched) => Json(ApiResponse::success(matched)),
+            Err(e) => Json(ApiResponse::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+async fn rules_export_handler(State(state): State<Arc<ApiState>>) -> Result<String, String> {
+    if let Some(manager) = &state.rule_manager {
+        manager.export_rules().map_err(|e| e)
+    } else {
+        Err("Rule manager not available".to_string())
+    }
+}
+
+async fn rules_import_handler(State(state): State<Arc<ApiState>>, Json(payload): Json<ImportRequest>) -> Json<ApiResponse<usize>> {
+    if let Some(manager) = &state.rule_manager {
+        match manager.import_rules(&payload.content) {
+            Ok(count) => Json(ApiResponse::success(count)),
+            Err(e) => Json(ApiResponse::error(&e)),
+        }
+    } else {
+        Json(ApiResponse::error("Rule manager not available"))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EnableRequest {
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TestRuleRequest {
+    rule: serde_json::Value,
+    event: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportRequest {
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiResponse<T> {
+    success: bool,
+    data: Option<T>,
+    error: Option<String>,
+}
+
+impl<T> ApiResponse<T> {
+    fn success(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
+    }
+
+    fn error(message: &str) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message.to_string()),
+        }
+    }
 }
 
 /// Health check response

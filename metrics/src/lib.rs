@@ -226,6 +226,18 @@ impl MetricsCollector {
             "Total configuration reloads",
             false,
         );
+        collector.register_metadata(
+            "active_plugins",
+            MetricType::Gauge,
+            "Number of active plugins",
+            false,
+        );
+        collector.register_metadata(
+            "active_rules",
+            MetricType::Gauge,
+            "Number of active rules",
+            false,
+        );
 
         collector
     }
@@ -616,16 +628,32 @@ impl MetricsCollector {
     }
 
     /// Record a config reload and broadcast the update
-    pub fn record_config_reload_with_broadcast(&self, success: bool) {
+    pub fn record_config_reload_with_broadcast(&self, success: bool, active_plugins: usize, active_rules: usize) {
         record_config_reload(self, success);
 
         // Also broadcast a health update with system status
         self.broadcast(MetricUpdate::Health {
             timestamp: Utc::now(),
             uptime_seconds: self.get_uptime_seconds(),
-            active_plugins: 0,  // Will be updated from snapshot
-            active_rules: 0,    // Will be updated from snapshot
+            active_plugins,
+            active_rules,
         });
+    }
+
+    /// Set the engine status gauges (active plugins and rules count)
+    pub fn set_engine_status(&self, active_plugins: usize, active_rules: usize) {
+        self.set_gauge("active_plugins", HashMap::new(), active_plugins as f64);
+        self.set_gauge("active_rules", HashMap::new(), active_rules as f64);
+    }
+
+    /// Update only the active rules gauge (without touching active_plugins)
+    pub fn set_active_rules(&self, active_rules: usize) {
+        self.set_gauge("active_rules", HashMap::new(), active_rules as f64);
+    }
+
+    /// Update only the active plugins gauge (without touching active_rules)
+    pub fn set_active_plugins(&self, active_plugins: usize) {
+        self.set_gauge("active_plugins", HashMap::new(), active_plugins as f64);
     }
 }
 

@@ -1,0 +1,22 @@
+[package]
+name = "tui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "tui"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+ratatui = "0.28"
+crossterm = "0.28"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"

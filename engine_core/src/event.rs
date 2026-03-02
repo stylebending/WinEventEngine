@@ -1,12 +1,14 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Instant;
 use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub id: Uuid,
-    pub timestamp: Instant,
+    #[serde(with = "chrono::serde::ts_microseconds")]
+    pub timestamp: DateTime<Utc>,
     pub kind: EventKind,
     pub source: String,
     pub metadata: HashMap<String, String>,
@@ -16,7 +18,7 @@ impl Event {
     pub fn new(kind: EventKind, source: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
-            timestamp: Instant::now(),
+            timestamp: Utc::now(),
             kind,
             source: source.into(),
             metadata: HashMap::new(),
@@ -29,7 +31,7 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     // File System Events
     FileCreated {
@@ -142,14 +144,14 @@ pub enum EventKind {
     TimerTick,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegistryChangeType {
     Created,
     Modified,
     Deleted,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkProtocol {
     Tcp,
     Udp,
