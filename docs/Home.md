@@ -34,7 +34,7 @@ New to WinEventEngine? This minimal example verifies everything works. You'll cr
 
 ### 1. Download
 
-Download `engine.exe` from [GitHub Releases](https://github.com/stylebending/win_event_engine/releases) and save it to a folder (e.g., `C:\Tools\win_event_engine\`).
+Download `engine.exe` from [GitHub Releases](https://github.com/stylebending/wineventengine/releases) and save it to a folder (e.g., `C:\Tools\wineventengine\`).
 
 ### 2. Create Your First Config
 
@@ -123,7 +123,7 @@ Once you've verified the engine works, try **media automation**:
 
 ### Development
 - **[Architecture](Architecture)** - Technical deep-dive into the system
-- **[Contributing](https://github.com/stylebending/win_event_engine/blob/main/CONTRIBUTING.md)** - How to contribute to the project
+- **[Contributing](https://github.com/stylebending/wineventengine/blob/main/CONTRIBUTING.md)** - How to contribute to the project
 
 ## Running as a Windows Service
 
@@ -214,7 +214,7 @@ See **[Configuration Reference](Configuration-Reference)** for more examples.
 
 ## Quick Links
 
-- [GitHub Repository](https://github.com/stylebending/win_event_engine)
-- [Releases](https://github.com/stylebending/win_event_engine/releases)
-- [Issues](https://github.com/stylebending/win_event_engine/issues)
-- [License: MIT](https://github.com/stylebending/win_event_engine/blob/main/LICENSE)
+- [GitHub Repository](https://github.com/stylebending/wineventengine)
+- [Releases](https://github.com/stylebending/wineventengine/releases)
+- [Issues](https://github.com/stylebending/wineventengine/issues)
+- [License: MIT](https://github.com/stylebending/wineventengine/blob/main/LICENSE)

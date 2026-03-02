@@ -1,4 +1,4 @@
-# AGENTS.md - Coding Guidelines for win_event_engine
+# AGENTS.md - Coding Guidelines for WinEventEngine
 
 ## Build Commands
 
