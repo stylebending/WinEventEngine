@@ -20,7 +20,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release
-        run: cargo build --release -p WinEventEngine
+        run: cargo build --release -p wineventengine
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2

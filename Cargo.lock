@@ -3,27 +3,6 @@
 version = 4
 
 [[package]]
-name = "WinEventEngine"
-version = "0.2.1"
-dependencies = [
- "chrono",
- "engine_core",
- "iced",
- "ico",
- "image",
- "rfd",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "win_event_engine",
- "windows",
- "winres",
-]
-
-[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5842,34 +5821,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
-name = "win_event_engine"
-version = "0.2.1"
-dependencies = [
- "actions",
- "async-trait",
- "bus",
- "clap",
- "engine_core",
- "glob",
- "lazy_static",
- "metrics",
- "notify",
- "parking_lot 0.12.5",
- "regex",
- "rules",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "windows",
- "windows-service",
-]
-
-[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6310,6 +6261,55 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
+
+[[package]]
+name = "wineventengine"
+version = "0.2.1"
+dependencies = [
+ "actions",
+ "async-trait",
+ "bus",
+ "clap",
+ "engine_core",
+ "glob",
+ "lazy_static",
+ "metrics",
+ "notify",
+ "parking_lot 0.12.5",
+ "regex",
+ "rules",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
+name = "wineventengine-gui"
+version = "0.2.1"
+dependencies = [
+ "chrono",
+ "engine_core",
+ "iced",
+ "ico",
+ "image",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "windows",
+ "wineventengine",
+ "winres",
+]
 
 [[package]]
 name = "winit"
