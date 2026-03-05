@@ -3,27 +3,6 @@
 version = 4
 
 [[package]]
-name = "WinEventEngine"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "engine_core",
- "iced",
- "ico",
- "image",
- "rfd",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "win_event_engine",
- "windows",
- "winres",
-]
-
-[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -41,7 +20,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "actions"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -504,7 +483,7 @@ checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
 name = "bus"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engine_core",
  "tokio",
@@ -1262,7 +1241,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "engine_core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2855,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "dashmap",
@@ -4118,7 +4097,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rules"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "engine_core",
  "glob",
@@ -5235,7 +5214,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -5842,34 +5821,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 
 [[package]]
-name = "win_event_engine"
-version = "0.2.0"
-dependencies = [
- "actions",
- "async-trait",
- "bus",
- "clap",
- "engine_core",
- "glob",
- "lazy_static",
- "metrics",
- "notify",
- "parking_lot 0.12.5",
- "regex",
- "rules",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "windows",
- "windows-service",
-]
-
-[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6310,6 +6261,55 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
+
+[[package]]
+name = "wineventengine"
+version = "0.2.1"
+dependencies = [
+ "actions",
+ "async-trait",
+ "bus",
+ "clap",
+ "engine_core",
+ "glob",
+ "lazy_static",
+ "metrics",
+ "notify",
+ "parking_lot 0.12.5",
+ "regex",
+ "rules",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
+name = "wineventengine-gui"
+version = "0.2.1"
+dependencies = [
+ "chrono",
+ "engine_core",
+ "iced",
+ "ico",
+ "image",
+ "rfd",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "windows",
+ "wineventengine",
+ "winres",
+]
 
 [[package]]
 name = "winit"

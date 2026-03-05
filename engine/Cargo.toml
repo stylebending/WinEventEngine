@@ -1,5 +1,5 @@
 [package]
-name = "WinEventEngine"
+name = "wineventengine"
 version.workspace = true
 edition.workspace = true
 
