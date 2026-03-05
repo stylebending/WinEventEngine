@@ -3,8 +3,8 @@ resolver = "2"
 members = ["actions", "bus", "engine", "engine_core", "gui", "metrics", "rules", "tui"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Stylebending"]
 license = "MIT"
-repository = "https://github.com/yourusername/win_event_engine"
+repository = "https://github.com/stylebending/wineventengine"

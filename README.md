@@ -96,7 +96,7 @@ cd WinEventEngine
 cargo build --release -p WinEventEngine
 
 # Build CLI only
-cargo build --release -p win_event_engine
+cargo build --release -p WinEventEngine
 
 # Run tests
 cargo test --workspace
