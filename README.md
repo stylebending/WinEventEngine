@@ -2,7 +2,7 @@
 
 <p align="center"><img src="https://readme-typing-svg.herokuapp.com?font=Fira+Code&pause=1000&center=true&width=435&lines=WinEventEngine;Simple+Configuration;Powerful+Results" alt="WinEventEngine" /></p>
 
-<p align="center"><a href="https://github.com/stylebending/WinEventEngine/releases"><img src="https://img.shields.io/github/v/release/stylebending/WinEventEngine?style=for-the-badge&color=darkgreen&logo=git&logoColor=white&label=Release&labelColor=darkgreen"></a> <a href="https://github.com/stylebending/WinEventEngine/releases"><img src="https://img.shields.io/github/actions/workflow/status/stylebending/WinEventEngine/.github/workflows/release.yml?style=for-the-badge&color=darkgreen&logo=github&logoColor=white&label=Build&labelColor=darkgreen"></a> <a href="https://github.com/stylebending/WinEventEngine/releases"><img src="https://img.shields.io/github/downloads/stylebending/WinEventEngine/total?color=darkgreen&logo=github&label=Github%20Downloads&style=for-the-badge&labelColor=darkgreen"></a></p>
+<p align="center"><a href="https://github.com/stylebending/WinEventEngine/releases"><img src="https://img.shields.io/github/downloads/stylebending/WinEventEngine/total?color=darkgreen&logo=github&label=Github%20Downloads&style=for-the-badge&labelColor=darkgreen"></a></p>
 
 <br>
 
