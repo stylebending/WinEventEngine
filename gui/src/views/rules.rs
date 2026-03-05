@@ -86,14 +86,14 @@ pub fn view_editor(app: &WinEventApp) -> Element<Message> {
         text("Trigger").size(18),
         pick_list(
             vec![
-                "file_created".to_string(),
-                "file_modified".to_string(),
-                "file_deleted".to_string(),
                 "window_focused".to_string(),
                 "window_unfocused".to_string(),
                 "window_created".to_string(),
                 "process_started".to_string(),
                 "process_stopped".to_string(),
+                "file_created".to_string(),
+                "file_modified".to_string(),
+                "file_deleted".to_string(),
                 "timer".to_string(),
             ],
             Some(app.trigger_type.clone()),
@@ -143,10 +143,10 @@ pub fn view_editor(app: &WinEventApp) -> Element<Message> {
         text("Action").size(18),
         pick_list(
             vec![
-                "log".to_string(),
+                "media".to_string(),
                 "execute".to_string(),
                 "powershell".to_string(),
-                "media".to_string(),
+                "log".to_string(),
             ],
             Some(app.action_type.clone()),
             Message::ActionTypeChanged,
@@ -189,6 +189,8 @@ pub fn view_editor(app: &WinEventApp) -> Element<Message> {
         "media" => column![pick_list(
             vec![
                 "play_pause".to_string(),
+                "play".to_string(),
+                "pause".to_string(),
                 "stop".to_string(),
                 "next".to_string(),
                 "previous".to_string(),

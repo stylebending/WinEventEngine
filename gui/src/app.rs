@@ -3,6 +3,7 @@ use iced::{Element, Length, Theme, Alignment};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use win_event_engine::{Engine, EngineStatus, RuleConfig};
+use win_event_engine::config::Config;
 
 use crate::theme::AppTheme;
 use crate::views::{dashboard, rules, settings, sources, tester};
@@ -19,7 +20,8 @@ pub struct WinEventApp {
     // Data - public
     pub events: Vec<EventDisplay>,
     pub rules: Vec<RuleConfig>,
-    
+    pub sources: Vec<serde_json::Value>,
+
     // UI State - public
     pub theme: AppTheme,
     pub notification: Option<(String, NotificationType)>,
@@ -120,7 +122,13 @@ pub enum Message {
     SaveRule(RuleConfig),
     CancelEdit,
     ToggleRule(String, bool),
-    
+
+    // Source management
+    RefreshSources,
+    SourcesUpdated(Vec<serde_json::Value>),
+    DeleteSource(String),
+    ToggleSource(String, bool),
+
     // Rule editor form updates
     RuleNameChanged(String),
     RuleDescriptionChanged(String),
@@ -189,8 +197,27 @@ pub enum Message {
 
 impl WinEventApp {
     pub fn new() -> (Self, iced::Task<Message>) {
-        let config = win_event_engine::create_demo_config();
-        let engine = Arc::new(Mutex::new(Engine::new(config, None)));
+        // Determine config directory
+        let config_dir = dirs::config_dir()
+            .map(|d| d.join("WinEventEngine"))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("config"));
+
+        let config_path = config_dir.join("config.toml");
+
+        // Load existing config or use empty default
+        let config = if config_path.exists() {
+            match Config::load_from_file(&config_path) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    eprintln!("Failed to load config from {:?}: {}", config_path, e);
+                    Config::default()
+                }
+            }
+        } else {
+            Config::default()
+        };
+
+        let engine = Arc::new(Mutex::new(Engine::new(config, Some(config_path))));
         let engine_clone = engine.clone();
         
         let app = Self {
@@ -203,6 +230,7 @@ impl WinEventApp {
             current_view: View::Dashboard,
             events: Vec::new(),
             rules: Vec::new(),
+            sources: Vec::new(),
             theme: AppTheme::Dark,
             notification: None,
             is_loading: true,
@@ -212,13 +240,13 @@ impl WinEventApp {
             rule_name: String::new(),
             rule_description: String::new(),
             rule_enabled: true,
-            trigger_type: "file_created".to_string(),
+            trigger_type: "window_focused".to_string(),
             trigger_path: String::new(),
             trigger_pattern: String::new(),
             trigger_title_contains: String::new(),
             trigger_process_name: String::new(),
             trigger_interval: "60".to_string(),
-            action_type: "log".to_string(),
+            action_type: "media".to_string(),
             action_command: String::new(),
             action_args: String::new(),
             action_script: String::new(),
@@ -272,6 +300,10 @@ impl WinEventApp {
                 // Refresh data when navigating to Rules view
                 if view == View::Rules {
                     return self.update(Message::RefreshData);
+                }
+                // Refresh sources when navigating to Sources view
+                if view == View::Sources {
+                    return self.update(Message::RefreshSources);
                 }
                 // Check service status and auto-start when navigating to Settings view
                 if view == View::Settings {
@@ -394,13 +426,13 @@ impl WinEventApp {
                 self.rule_name = String::new();
                 self.rule_description = String::new();
                 self.rule_enabled = true;
-                self.trigger_type = "file_created".to_string();
+                self.trigger_type = "window_focused".to_string();
                 self.trigger_path = String::new();
                 self.trigger_pattern = String::new();
                 self.trigger_title_contains = String::new();
                 self.trigger_process_name = String::new();
                 self.trigger_interval = "60".to_string();
-                self.action_type = "log".to_string();
+                self.action_type = "media".to_string();
                 self.action_command = String::new();
                 self.action_args = String::new();
                 self.action_script = String::new();
@@ -688,6 +720,90 @@ impl WinEventApp {
                 self.rules = rules_json.iter()
                     .filter_map(|v| serde_json::from_value(v.clone()).ok())
                     .collect();
+                iced::Task::none()
+            }
+
+            Message::RefreshSources => {
+                if let Some(engine) = &self.engine {
+                    let engine_clone = engine.clone();
+                    return iced::Task::perform(
+                        async move {
+                            let eng = engine_clone.lock().await;
+                            let manager = eng.create_rule_manager();
+                            manager.get_sources().await
+                        },
+                        |sources| Message::SourcesUpdated(sources),
+                    );
+                }
+                iced::Task::none()
+            }
+
+            Message::SourcesUpdated(sources) => {
+                self.sources = sources;
+                iced::Task::none()
+            }
+
+            Message::DeleteSource(name) => {
+                if let Some(engine) = &self.engine {
+                    let engine_clone = engine.clone();
+                    let name_clone = name.clone();
+                    return iced::Task::perform(
+                        async move {
+                            let eng = engine_clone.lock().await;
+                            let manager = eng.create_rule_manager();
+                            manager.delete_source(&name_clone).await
+                        },
+                        move |result| match result {
+                            Ok(_) => Message::Batch(vec![
+                                Message::RefreshSources,
+                                Message::NotificationShowTimed(
+                                    format!("Source '{}' deleted", name),
+                                    NotificationType::Success,
+                                    3,
+                                ),
+                            ]),
+                            Err(e) => Message::NotificationShowTimed(
+                                format!("Failed to delete source: {}", e),
+                                NotificationType::Error,
+                                5,
+                            ),
+                        },
+                    );
+                }
+                iced::Task::none()
+            }
+
+            Message::ToggleSource(name, enabled) => {
+                if let Some(engine) = &self.engine {
+                    let engine_clone = engine.clone();
+                    let name_clone = name.clone();
+                    return iced::Task::perform(
+                        async move {
+                            let eng = engine_clone.lock().await;
+                            let manager = eng.create_rule_manager();
+                            manager.enable_source(&name_clone, enabled).await
+                        },
+                        move |result| match result {
+                            Ok(_) => Message::Batch(vec![
+                                Message::RefreshSources,
+                                Message::NotificationShowTimed(
+                                    format!(
+                                        "Source '{}' {}",
+                                        name,
+                                        if enabled { "enabled" } else { "disabled" }
+                                    ),
+                                    NotificationType::Success,
+                                    3,
+                                ),
+                            ]),
+                            Err(e) => Message::NotificationShowTimed(
+                                format!("Failed to toggle source: {}", e),
+                                NotificationType::Error,
+                                5,
+                            ),
+                        },
+                    );
+                }
                 iced::Task::none()
             }
 

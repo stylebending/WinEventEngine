@@ -309,12 +309,30 @@ impl Config {
 
         Ok(())
     }
+
+    pub fn save_to_file(&self, path: &PathBuf) -> Result<(), ConfigError> {
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| ConfigError::FileWrite(parent.to_path_buf(), e.to_string()))?;
+        }
+
+        let toml_string =
+            toml::to_string_pretty(self).map_err(|e| ConfigError::Serialize(e.to_string()))?;
+
+        std::fs::write(path, toml_string)
+            .map_err(|e| ConfigError::FileWrite(path.clone(), e.to_string()))?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum ConfigError {
     FileRead(PathBuf, String),
+    FileWrite(PathBuf, String),
     Parse(String),
+    Serialize(String),
     Validation(String),
 }
 
@@ -324,7 +342,11 @@ impl std::fmt::Display for ConfigError {
             ConfigError::FileRead(path, msg) => {
                 write!(f, "Failed to read config file {:?}: {}", path, msg)
             }
+            ConfigError::FileWrite(path, msg) => {
+                write!(f, "Failed to write config file {:?}: {}", path, msg)
+            }
             ConfigError::Parse(msg) => write!(f, "Failed to parse config: {}", msg),
+            ConfigError::Serialize(msg) => write!(f, "Failed to serialize config: {}", msg),
             ConfigError::Validation(msg) => write!(f, "Config validation error: {}", msg),
         }
     }

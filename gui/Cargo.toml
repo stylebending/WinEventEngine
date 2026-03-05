@@ -35,7 +35,8 @@ engine_core = { path = "../engine_core" }
 # Other utilities
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+dirs = "5"
 
 # File dialogs
 rfd = "0.14"

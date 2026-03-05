@@ -220,33 +220,52 @@ Configure what happens when the rule matches:
 
 ## Event Sources
 
-The Sources tab shows configured event sources (plugins).
+The Sources tab allows you to manage event sources (plugins) that monitor the system for events.
 
 ### Source List
 
-Displays all event sources with their status:
+Displays all event sources with their status and controls:
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│ Event Sources                                            │
+│ Event Sources                              [Refresh] [+] │
 ├──────────────────────────────────────────────────────────┤
 │                                                          │
-│  ☑ file_monitor                                         │
-│     Type: File Watcher                                   │
-│     Paths: C:/Data, D:/Backup                            │
-│     Pattern: *.txt                                       │
-│                                                          │
-│  ☑ window_watcher                                       │
-│     Type: Window Watcher                                 │
+│  file_monitor                        (file_watcher) ☑ [Delete]│
+│  window_watcher                      (window_watcher) ☑ [Delete]│
 │                                                          │
 └──────────────────────────────────────────────────────────┘
 ```
 
-### Adding Sources
+**Columns:**
+- **Name**: Source identifier
+- **Type**: Source type (file_watcher, window_watcher, etc.)
+- **Toggle**: Enable/disable the source
+- **Delete**: Remove the source
 
-Sources are typically auto-provisioned when you create rules, but you can view their configuration here.
+### Managing Sources
 
-**Note:** Source configuration is primarily managed through the TOML config file. The GUI displays current sources but editing is limited.
+**Enable/Disable Sources:**
+- Click the toggle switch to enable or disable a source
+- Disabled sources stop monitoring but remain in configuration
+- Changes are saved automatically
+
+**Delete Sources:**
+- Click the **Delete** button to remove a source
+- This stops the source and removes it from configuration
+- Rules using this source will no longer trigger
+
+**Refresh Sources:**
+- Click **Refresh** to reload the source list
+- Useful after manual config file edits
+
+### Persistence
+
+Sources configured through the GUI are automatically saved to:
+- **GUI**: `%APPDATA%\WinEventEngine\config.toml`
+- **CLI**: `config.toml` in the working directory
+
+Sources persist between application restarts and are loaded automatically on startup.
 
 ## Event Tester
 

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use engine_core::event::{Event, EventKind};
 use engine_core::plugin::{EventEmitter, EventSourcePlugin, PluginError};
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -11,10 +12,10 @@ use tracing::{error, info, warn};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, GetWindowThreadProcessId, PostThreadMessageW};
-use windows::Win32::UI::WindowsAndMessaging::{EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT};
+use windows::Win32::UI::WindowsAndMessaging::{EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, EVENT_OBJECT_NAMECHANGE, WINEVENT_OUTOFCONTEXT, WM_QUIT, GetAncestor, GA_ROOT};
 use windows::core::PWSTR;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, GetCurrentThreadId,
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, GetCurrentThreadId, GetCurrentProcessId,
 };
 
 #[derive(Debug, Clone)]
@@ -35,12 +36,17 @@ enum WindowEvent {
         hwnd: HWND,
         title: Option<String>,
     },
+    TitleChanged {
+        hwnd: HWND,
+        title: String,
+    },
 }
 
 pub struct WindowEventPlugin {
     name: String,
     is_running: Arc<AtomicBool>,
     previous_hwnd: Arc<tokio::sync::Mutex<Option<HWND>>>,
+    focused_window_titles: Arc<tokio::sync::Mutex<HashMap<isize, String>>>,
     title_filter: Option<Regex>,
     process_filter: Option<Regex>,
     hook_thread: Option<JoinHandle<()>>,
@@ -54,6 +60,7 @@ impl WindowEventPlugin {
             name: name.into(),
             is_running: Arc::new(AtomicBool::new(false)),
             previous_hwnd: Arc::new(tokio::sync::Mutex::new(None)),
+            focused_window_titles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             title_filter: None,
             process_filter: None,
             hook_thread: None,
@@ -156,7 +163,7 @@ impl WindowEventPlugin {
                 Some(win_event_callback),
                 0,
                 0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                WINEVENT_OUTOFCONTEXT,
             )
         };
 
@@ -168,7 +175,7 @@ impl WindowEventPlugin {
                 Some(win_event_callback),
                 0,
                 0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                WINEVENT_OUTOFCONTEXT,
             )
         };
 
@@ -180,22 +187,35 @@ impl WindowEventPlugin {
                 Some(win_event_callback),
                 0,
                 0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                WINEVENT_OUTOFCONTEXT,
             )
         };
 
-        if foreground_hook.0 == 0 || create_hook.0 == 0 || destroy_hook.0 == 0 {
+        let name_change_hook = unsafe {
+            SetWinEventHook(
+                EVENT_OBJECT_NAMECHANGE,
+                EVENT_OBJECT_NAMECHANGE,
+                None,
+                Some(win_event_callback),
+                0,
+                0,
+                WINEVENT_OUTOFCONTEXT,
+            )
+        };
+
+        if foreground_hook.0 == 0 || create_hook.0 == 0 || destroy_hook.0 == 0 || name_change_hook.0 == 0 {
             unsafe {
                 if foreground_hook.0 != 0 { let _ = UnhookWinEvent(foreground_hook); }
                 if create_hook.0 != 0 { let _ = UnhookWinEvent(create_hook); }
                 if destroy_hook.0 != 0 { let _ = UnhookWinEvent(destroy_hook); }
+                if name_change_hook.0 != 0 { let _ = UnhookWinEvent(name_change_hook); }
             }
             return Err("Failed to set one or more Windows event hooks".to_string());
         }
 
         // Store hooks in thread-local storage for cleanup
         let _ = HOOKS.with(|h| {
-            *h.borrow_mut() = Some((foreground_hook, create_hook, destroy_hook));
+            *h.borrow_mut() = Some((foreground_hook, create_hook, destroy_hook, name_change_hook));
         });
 
         // Store sender for callback to use
@@ -222,6 +242,7 @@ impl WindowEventPlugin {
             let _ = UnhookWinEvent(foreground_hook);
             let _ = UnhookWinEvent(create_hook);
             let _ = UnhookWinEvent(destroy_hook);
+            let _ = UnhookWinEvent(name_change_hook);
         }
 
         let _ = HOOKS.with(|h| {
@@ -238,7 +259,7 @@ impl WindowEventPlugin {
 
 // Thread-local storage for hooks and sender
 thread_local! {
-    static HOOKS: std::cell::RefCell<Option<(windows::Win32::UI::Accessibility::HWINEVENTHOOK, windows::Win32::UI::Accessibility::HWINEVENTHOOK, windows::Win32::UI::Accessibility::HWINEVENTHOOK)>> = std::cell::RefCell::new(None);
+    static HOOKS: std::cell::RefCell<Option<(windows::Win32::UI::Accessibility::HWINEVENTHOOK, windows::Win32::UI::Accessibility::HWINEVENTHOOK, windows::Win32::UI::Accessibility::HWINEVENTHOOK, windows::Win32::UI::Accessibility::HWINEVENTHOOK)>> = std::cell::RefCell::new(None);
     static EVENT_SENDER: std::cell::RefCell<Option<Sender<WindowEvent>>> = std::cell::RefCell::new(None);
 }
 
@@ -246,8 +267,8 @@ unsafe extern "system" fn win_event_callback(
     _hook: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
     event: u32,
     hwnd: HWND,
-    _id_object: i32,
-    _id_child: i32,
+    id_object: i32,
+    id_child: i32,
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
@@ -261,6 +282,7 @@ unsafe extern "system" fn win_event_callback(
         EVENT_SYSTEM_FOREGROUND => "focus",
         EVENT_OBJECT_CREATE => "create",
         EVENT_OBJECT_DESTROY => "destroy",
+        EVENT_OBJECT_NAMECHANGE => "name_change",
         _ => return,
     };
 
@@ -299,6 +321,17 @@ unsafe extern "system" fn win_event_callback(
                         title,
                     })
                 }
+                "name_change" => {
+                    // Get the new title for name change events
+                    let title = WindowEventPlugin::get_window_info(hwnd)
+                        .map(|(t, _, _)| t)
+                        .unwrap_or_default();
+                    info!("Window title changed: hwnd={:?}, title='{}'", hwnd, title);
+                    Some(WindowEvent::TitleChanged {
+                        hwnd,
+                        title,
+                    })
+                }
                 _ => None,
             };
 
@@ -325,10 +358,14 @@ impl EventSourcePlugin for WindowEventPlugin {
         let plugin_name = self.name.clone();
         let is_running = self.is_running.clone();
         let previous_hwnd = self.previous_hwnd.clone();
+        let focused_window_titles = self.focused_window_titles.clone();
         let title_filter = self.title_filter.clone();
         let process_filter = self.process_filter.clone();
 
         self.is_running.store(true, Ordering::SeqCst);
+
+        // Get current process ID to filter out GUI windows
+        let current_process_id = unsafe { GetCurrentProcessId() };
 
         // Create channel for thread communication
         let (event_sender, event_receiver) = mpsc::channel::<WindowEvent>();
@@ -375,6 +412,10 @@ impl EventSourcePlugin for WindowEventPlugin {
                     Ok(window_event) => {
                         match window_event {
                             WindowEvent::Focused { hwnd, title, process_name, process_id } => {
+                                // Check if this window belongs to our own process (GUI window)
+                                // We track it for proper focus chain management, but don't emit events
+                                let is_own_process = process_id == current_process_id;
+
                                 // Check filters
                                 let passes = if let Some(ref title_regex) = title_filter {
                                     title_regex.is_match(&title)
@@ -394,36 +435,113 @@ impl EventSourcePlugin for WindowEventPlugin {
                                 let mut prev_guard = previous_hwnd.lock().await;
                                 if let Some(prev_hwnd) = *prev_guard {
                                     if prev_hwnd.0 != hwnd.0 {
-                                        if let Some((prev_title, _, _)) = WindowEventPlugin::get_window_info(prev_hwnd) {
-                                            let unfocus_event = Event::new(
-                                                EventKind::WindowUnfocused {
-                                                    hwnd: prev_hwnd.0 as isize,
-                                                    title: prev_title.clone(),
+                                        // Only emit unfocus event if previous window is not our own
+                                        let prev_process_id = {
+                                            let mut pid = 0u32;
+                                            unsafe { GetWindowThreadProcessId(prev_hwnd, Some(&mut pid)) };
+                                            pid
+                                        };
+                                        if prev_process_id != current_process_id {
+                                            if let Some((prev_title, _, _)) = WindowEventPlugin::get_window_info(prev_hwnd) {
+                                                let unfocus_event = Event::new(
+                                                    EventKind::WindowUnfocused {
+                                                        hwnd: prev_hwnd.0 as isize,
+                                                        title: prev_title.clone(),
+                                                    },
+                                                    &plugin_name,
+                                                ).with_metadata("window_title", &prev_title);
+
+                                                let _ = emitter.try_send(unfocus_event);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check if this is the same window but title changed (browser tab switch scenario)
+                                let hwnd_key = hwnd.0 as isize;
+                                let mut titles_guard = focused_window_titles.lock().await;
+                                
+                                if let Some(old_title) = titles_guard.get(&hwnd_key) {
+                                    // Same window already tracked - check if title changed
+                                    if old_title != &title {
+                                        info!("Same window, title changed: '{}' -> '{}'", old_title, title);
+                                        
+                                        // Check if title pattern match status changed
+                                        let old_matches = if let Some(ref title_regex) = title_filter {
+                                            title_regex.is_match(old_title)
+                                        } else {
+                                            true
+                                        };
+                                        
+                                        let new_matches = if let Some(ref title_regex) = title_filter {
+                                            title_regex.is_match(&title)
+                                        } else {
+                                            true
+                                        };
+                                        
+                                        info!("Pattern matching: old_matches={}, new_matches={}", old_matches, new_matches);
+                                        
+                                        // Pattern match status changed - emit synthetic focus/unfocus events
+                                        if !old_matches && new_matches {
+                                            // Started matching - emit WindowFocused
+                                            info!("Title changed to match pattern: '{}' -> '{}'", old_title, title);
+                                            let focus_event = Event::new(
+                                                EventKind::WindowFocused {
+                                                    hwnd: hwnd_key,
+                                                    title: title.clone(),
                                                 },
                                                 &plugin_name,
-                                            ).with_metadata("window_title", &prev_title);
+                                            )
+                                            .with_metadata("window_title", &title)
+                                            .with_metadata("title_changed", "true");
+                                            
+                                            let _ = emitter.try_send(focus_event);
+                                        } else if old_matches && !new_matches {
+                                            // Stopped matching - emit WindowUnfocused
+                                            info!("Title changed to no longer match pattern: '{}' -> '{}'", old_title, title);
+                                            let unfocus_event = Event::new(
+                                                EventKind::WindowUnfocused {
+                                                    hwnd: hwnd_key,
+                                                    title: old_title.clone(),
+                                                },
+                                                &plugin_name,
+                                            )
+                                            .with_metadata("window_title", old_title)
+                                            .with_metadata("title_changed", "true");
                                             
                                             let _ = emitter.try_send(unfocus_event);
                                         }
                                     }
                                 }
-
-                                // Send focus event for new window
-                                let focus_event = Event::new(
-                                    EventKind::WindowFocused {
-                                        hwnd: hwnd.0 as isize,
-                                        title: title.clone(),
-                                    },
-                                    &plugin_name,
-                                )
-                                .with_metadata("window_title", &title)
-                                .with_metadata("process_id", process_id.to_string())
-                                .with_metadata("process_name", &process_name);
                                 
-                                let _ = emitter.try_send(focus_event);
+                                // Update stored title
+                                titles_guard.insert(hwnd_key, title.clone());
+                                drop(titles_guard);
+                                
+                                // Only emit focus event if this is not our own process window
+                                if !is_own_process {
+                                    let focus_event = Event::new(
+                                        EventKind::WindowFocused {
+                                            hwnd: hwnd.0 as isize,
+                                            title: title.clone(),
+                                        },
+                                        &plugin_name,
+                                    )
+                                    .with_metadata("window_title", &title)
+                                    .with_metadata("process_id", process_id.to_string())
+                                    .with_metadata("process_name", &process_name);
+
+                                    let _ = emitter.try_send(focus_event);
+                                }
+                                
                                 *prev_guard = Some(hwnd);
                             }
                             WindowEvent::Created { hwnd, title, process_name, process_id } => {
+                                // Skip windows from our own process (GUI windows)
+                                if process_id == current_process_id {
+                                    continue;
+                                }
+
                                 // Check filters
                                 let passes = if let Some(ref title_regex) = title_filter {
                                     title_regex.is_match(&title)
@@ -449,24 +567,108 @@ impl EventSourcePlugin for WindowEventPlugin {
                                 )
                                 .with_metadata("window_title", &title)
                                 .with_metadata("process_name", &process_name);
-                                
+
                                 let _ = emitter.try_send(create_event);
                             }
                             WindowEvent::Destroyed { hwnd, title } => {
+                                // Check if destroyed window belongs to our own process
+                                let process_id = {
+                                    let mut pid = 0u32;
+                                    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+                                    pid
+                                };
+                                if process_id == current_process_id {
+                                    continue;
+                                }
+
                                 let destroyed_event = Event::new(
                                     EventKind::WindowDestroyed {
                                         hwnd: hwnd.0 as isize,
                                     },
                                     &plugin_name,
                                 );
-                                
+
                                 let destroyed_event = if let Some(ref t) = title {
                                     destroyed_event.with_metadata("window_title", t)
                                 } else {
                                     destroyed_event
                                 };
-                                
+
                                 let _ = emitter.try_send(destroyed_event);
+                                
+                                // Remove from title tracking
+                                {
+                                    let mut titles_guard = focused_window_titles.lock().await;
+                                    titles_guard.remove(&(hwnd.0 as isize));
+                                }
+                            }
+                            WindowEvent::TitleChanged { hwnd, title } => {
+                                // Get the root window - browsers fire events on child objects
+                                let root_hwnd = unsafe { GetAncestor(hwnd, GA_ROOT) };
+                                let root_hwnd_key = root_hwnd.0 as isize;
+                                let event_hwnd_key = hwnd.0 as isize;
+                                
+                                // Check process of the ROOT window
+                                let process_id = {
+                                    let mut pid = 0u32;
+                                    unsafe { GetWindowThreadProcessId(root_hwnd, Some(&mut pid)) };
+                                    pid
+                                };
+                                
+                                // Skip our own process windows
+                                if process_id == current_process_id {
+                                    continue;
+                                }
+                                
+                                // Check if the ROOT window is in our focused windows tracking
+                                let mut titles_guard = focused_window_titles.lock().await;
+                                
+                                // Try to find the window - either the root or check if event hwnd matches directly
+                                let (lookup_hwnd_key, old_title_opt) = if let Some(old) = titles_guard.get(&root_hwnd_key) {
+                                    (root_hwnd_key, Some(old.clone()))
+                                } else if let Some(old) = titles_guard.get(&event_hwnd_key) {
+                                    (event_hwnd_key, Some(old.clone()))
+                                } else {
+                                    // Window not in tracking - skip
+                                    continue;
+                                };
+                                
+                                if let Some(old_title) = old_title_opt {
+                                    // Only process if title actually changed
+                                    if old_title != title {
+                                        // Always emit synthetic unfocus for old title and focus for new title
+                                        // This allows the rule engine to properly check title_contains patterns
+                                        
+                                        // Emit WindowUnfocused for the old title
+                                        let unfocus_event = Event::new(
+                                            EventKind::WindowUnfocused {
+                                                hwnd: lookup_hwnd_key,
+                                                title: old_title.clone(),
+                                            },
+                                            &plugin_name,
+                                        )
+                                        .with_metadata("window_title", old_title)
+                                        .with_metadata("title_changed", "true");
+                                        
+                                        let _ = emitter.try_send(unfocus_event);
+                                        
+                                        // Emit WindowFocused for the new title
+                                        let focus_event = Event::new(
+                                            EventKind::WindowFocused {
+                                                hwnd: lookup_hwnd_key,
+                                                title: title.clone(),
+                                            },
+                                            &plugin_name,
+                                        )
+                                        .with_metadata("window_title", &title)
+                                        .with_metadata("title_changed", "true");
+                                        
+                                        let _ = emitter.try_send(focus_event);
+                                        
+                                        // Update stored title
+                                        titles_guard.insert(lookup_hwnd_key, title);
+                                    }
+                                }
                             }
                         }
                     }

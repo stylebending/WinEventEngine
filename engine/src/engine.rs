@@ -61,19 +61,21 @@ impl Engine {
         }).unwrap_or_else(|| PathBuf::from("automations.json"));
         
         // Load existing automations from file if it exists
-        let mut rule_configs: Vec<RuleConfig> = config.rules.clone();
+        // User automations take precedence over config rules
+        let mut rule_configs: Vec<RuleConfig> = Vec::new();
         if automations_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&automations_path) {
                 if let Ok(loaded) = serde_json::from_str::<Vec<RuleConfig>>(&content) {
-                    // Merge: add automations that don't exist in config
-                    let loaded_count = loaded.len();
-                    for rule in loaded {
-                        if !rule_configs.iter().any(|r| r.name == rule.name) {
-                            rule_configs.push(rule);
-                        }
-                    }
-                    info!("Loaded {} rules from automations.json", loaded_count);
+                    rule_configs.extend(loaded);
+                    info!("Loaded {} rules from automations.json", rule_configs.len());
                 }
+            }
+        }
+
+        // Add config rules that don't conflict with user automations
+        for rule in &config.rules {
+            if !rule_configs.iter().any(|r| r.name == rule.name) {
+                rule_configs.push(rule.clone());
             }
         }
         
@@ -739,6 +741,8 @@ impl Engine {
             .expect("Engine must be initialized before creating rule manager");
 
         EngineRuleManager {
+            config: Arc::new(RwLock::new(self.config.clone())),
+            config_path: self.config_path.clone(),
             rule_configs: self.rule_configs.clone(),
             rules: self.rules.clone(),
             action_executor: self.action_executor.clone(),
@@ -1142,6 +1146,8 @@ impl Engine {
 }
 
 pub struct EngineRuleManager {
+    config: Arc<RwLock<Config>>,
+    config_path: Option<PathBuf>,
     rule_configs: Arc<RwLock<Vec<RuleConfig>>>,
     rules: Arc<RwLock<Vec<Rule>>>,
     action_executor: Arc<RwLock<ActionExecutor>>,
@@ -1153,21 +1159,30 @@ pub struct EngineRuleManager {
 }
 
 impl EngineRuleManager {
-    pub async fn save_to_file(&self) {
+    pub async fn save_to_file(&self) -> Result<(), String> {
         if let Some(ref path) = self.automations_path {
+            // Ensure parent directory exists
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    return Err(format!("Failed to create directory {:?}: {}", parent, e));
+                }
+            }
+
             let configs = self.rule_configs.read().await;
             match serde_json::to_string_pretty(&*configs) {
                 Ok(json) => {
-                    if let Err(e) = std::fs::write(path, json) {
-                        error!("Failed to save automations: {}", e);
-                    } else {
-                        info!("Saved {} rules to automations.json", configs.len());
+                    match std::fs::write(path, json) {
+                        Ok(_) => {
+                            info!("Saved {} rules to automations.json", configs.len());
+                            Ok(())
+                        }
+                        Err(e) => Err(format!("Failed to write automations file: {}", e)),
                     }
                 }
-                Err(e) => {
-                    error!("Failed to serialize automations: {}", e);
-                }
+                Err(e) => Err(format!("Failed to serialize automations: {}", e)),
             }
+        } else {
+            Err("No automations path configured".to_string())
         }
     }
 
@@ -1266,7 +1281,7 @@ impl EngineRuleManager {
 
         configs.push(rule_config.clone());
         drop(configs);
-        self.save_to_file().await;
+        self.save_to_file().await?;
         self.rebuild_active_rules().await;
 
         Ok(serde_json::to_value(rule_config).unwrap())
@@ -1281,9 +1296,9 @@ impl EngineRuleManager {
         if let Some(existing) = configs.iter_mut().find(|r| r.name == name) {
             *existing = rule_config.clone();
             drop(configs);
-            self.save_to_file().await;
+            self.save_to_file().await?;
             self.rebuild_active_rules().await;
-            
+
             Ok(serde_json::to_value(rule_config).unwrap())
         } else {
             Err(format!("Rule '{}' not found", name))
@@ -1294,10 +1309,10 @@ impl EngineRuleManager {
         let mut configs = self.rule_configs.write().await;
         let initial_len = configs.len();
         configs.retain(|r| r.name != name);
-        
+
         if configs.len() < initial_len {
             drop(configs);
-            self.save_to_file().await;
+            self.save_to_file().await?;
             self.rebuild_active_rules().await;
             Ok(())
         } else {
@@ -1307,11 +1322,11 @@ impl EngineRuleManager {
 
     pub async fn enable_rule(&self, name: &str, enabled: bool) -> Result<(), String> {
         let mut configs = self.rule_configs.write().await;
-        
+
         if let Some(rule) = configs.iter_mut().find(|r| r.name == name) {
             rule.enabled = enabled;
             drop(configs);
-            self.save_to_file().await;
+            self.save_to_file().await?;
             self.rebuild_active_rules().await;
             Ok(())
         } else {
@@ -1395,11 +1410,102 @@ impl EngineRuleManager {
         drop(configs);
 
         if count > 0 {
-            self.save_to_file().await;
+            self.save_to_file().await?;
             self.rebuild_active_rules().await;
         }
 
         Ok(count)
+    }
+
+    // Source management methods
+    pub async fn get_sources(&self) -> Vec<serde_json::Value> {
+        let config = self.config.read().await;
+        config
+            .sources
+            .iter()
+            .filter_map(|s| serde_json::to_value(s).ok())
+            .collect()
+    }
+
+    pub async fn add_source(&self, source: serde_json::Value) -> Result<serde_json::Value, String> {
+        let source_config: SourceConfig = serde_json::from_value(source)
+            .map_err(|e| format!("Invalid source format: {}", e))?;
+
+        if source_config.name.is_empty() {
+            return Err("Source name cannot be empty".to_string());
+        }
+
+        let mut config = self.config.write().await;
+
+        if config.sources.iter().any(|s| s.name == source_config.name) {
+            return Err(format!("Source '{}' already exists", source_config.name));
+        }
+
+        // Start the plugin if enabled
+        if source_config.enabled {
+            let type_name = source_config.source_type.type_name().to_string();
+            if let Err(e) = self.plugin_request_tx.try_send(source_config.clone()) {
+                error!("Failed to request plugin start: {}", e);
+            } else {
+                self.running_source_types.write().await.insert(type_name);
+            }
+        }
+
+        config.sources.push(source_config.clone());
+        drop(config);
+
+        self.save_config().await;
+
+        Ok(serde_json::to_value(source_config).unwrap())
+    }
+
+    pub async fn delete_source(&self, name: &str) -> Result<(), String> {
+        let mut config = self.config.write().await;
+        let initial_len = config.sources.len();
+        config.sources.retain(|s| s.name != name);
+
+        if config.sources.len() < initial_len {
+            drop(config);
+            self.save_config().await;
+            Ok(())
+        } else {
+            Err(format!("Source '{}' not found", name))
+        }
+    }
+
+    pub async fn enable_source(&self, name: &str, enabled: bool) -> Result<(), String> {
+        let mut config = self.config.write().await;
+
+        if let Some(source) = config.sources.iter_mut().find(|s| s.name == name) {
+            source.enabled = enabled;
+
+            // Start/stop plugin based on enabled state
+            if enabled {
+                let type_name = source.source_type.type_name().to_string();
+                if let Err(e) = self.plugin_request_tx.try_send(source.clone()) {
+                    error!("Failed to request plugin start: {}", e);
+                } else {
+                    self.running_source_types.write().await.insert(type_name);
+                }
+            }
+
+            drop(config);
+            self.save_config().await;
+            Ok(())
+        } else {
+            Err(format!("Source '{}' not found", name))
+        }
+    }
+
+    async fn save_config(&self) {
+        if let Some(ref path) = self.config_path {
+            let config = self.config.read().await;
+            if let Err(e) = config.save_to_file(path) {
+                error!("Failed to save config: {}", e);
+            } else {
+                info!("Saved config to {:?}", path);
+            }
+        }
     }
 }
 

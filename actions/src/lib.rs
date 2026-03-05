@@ -204,6 +204,7 @@ impl Action for PowerShellAction {
 }
 
 /// Media key action that uses direct Windows API calls (keybd_event) for instant media control
+/// Supports smart play/pause that checks current media state before acting
 #[derive(Debug, Clone)]
 pub struct MediaKeyAction {
     pub command: String,
@@ -229,6 +230,73 @@ impl MediaKeyAction {
             _ => 0xB3,                                          // Default to play/pause
         }
     }
+
+    /// Check if media is currently playing using Windows GSMTC API
+    /// Returns true if media is playing, false if paused/stopped or if state cannot be determined
+    #[cfg(target_os = "windows")]
+    fn is_media_playing(&self) -> bool {
+        use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager;
+
+        // Try to get the session manager
+        let manager_result = GlobalSystemMediaTransportControlsSessionManager::RequestAsync();
+
+        // Block on the async operation with a timeout
+        let manager = match manager_result {
+            Ok(operation) => {
+                // Use a simple blocking approach with timeout
+                match operation.get() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        info!("Failed to get media session manager: {}", e);
+                        return false; // Assume not playing if we can't determine state
+                    }
+                }
+            }
+            Err(e) => {
+                info!("Failed to request media session manager: {}", e);
+                return false; // Assume not playing if we can't determine state
+            }
+        };
+
+        // Get the current session
+        let session = match manager.GetCurrentSession() {
+            Ok(s) => s,
+            Err(_) => {
+                // No active media session - assume not playing
+                return false;
+            }
+        };
+
+        // Get playback info
+        let playback_info = match session.GetPlaybackInfo() {
+            Ok(info) => info,
+            Err(e) => {
+                info!("Failed to get playback info: {}", e);
+                return false; // Assume not playing if we can't determine state
+            }
+        };
+
+        // Check the playback status
+        match playback_info.PlaybackStatus() {
+            Ok(status) => {
+                use windows::Media::Control::GlobalSystemMediaTransportControlsSessionPlaybackStatus;
+                matches!(
+                    status,
+                    GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing
+                )
+            }
+            Err(e) => {
+                info!("Failed to get playback status: {}", e);
+                false // Assume not playing if we can't determine state
+            }
+        }
+    }
+
+    /// Check if media is currently playing (non-Windows fallback)
+    #[cfg(not(target_os = "windows"))]
+    fn is_media_playing(&self) -> bool {
+        false // Assume not playing on non-Windows platforms
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -238,23 +306,54 @@ impl Action for MediaKeyAction {
             keybd_event, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP,
         };
 
-        let vk_code = self.get_vk_code();
+        // Handle smart play/pause commands
+        let should_send_key = match self.command.as_str() {
+            "play" => {
+                // Only send toggle if not already playing
+                let is_playing = self.is_media_playing();
+                if is_playing {
+                    info!("Media is already playing, not sending play command");
+                    return Ok(ActionResult::Success {
+                        message: Some("Media already playing".to_string()),
+                    });
+                }
+                true
+            }
+            "pause" => {
+                // Only send toggle if currently playing
+                let is_playing = self.is_media_playing();
+                if !is_playing {
+                    info!("Media is not playing, not sending pause command");
+                    return Ok(ActionResult::Success {
+                        message: Some("Media not playing".to_string()),
+                    });
+                }
+                true
+            }
+            _ => true, // All other commands (play_pause, next, previous, etc.) always execute
+        };
 
-        info!(
-            "Sending media key: {} (VK: 0x{:02X})",
-            self.command, vk_code
-        );
+        if should_send_key {
+            let vk_code = self.get_vk_code();
 
-        unsafe {
-            // Press the key
-            keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY, 0);
-            // Release the key
-            keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+            info!(
+                "Sending media key: {} (VK: 0x{:02X})",
+                self.command, vk_code
+            );
+
+            unsafe {
+                // Press the key
+                keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY, 0);
+                // Release the key
+                keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+            }
+
+            Ok(ActionResult::Success {
+                message: Some(format!("Media key '{}' sent", self.command)),
+            })
+        } else {
+            unreachable!() // Should have returned earlier
         }
-
-        Ok(ActionResult::Success {
-            message: Some(format!("Media key '{}' sent", self.command)),
-        })
     }
 
     fn description(&self) -> String {

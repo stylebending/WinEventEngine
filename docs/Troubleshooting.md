@@ -98,6 +98,27 @@ paths = ["C:/Data"]
 echo "test" > C:/Monitored/test.txt
 ```
 
+### Configuration Not Persisting
+
+**Problem**: Created rules or sources disappear after restarting the GUI
+
+**Solution**: This was a bug in earlier versions. The GUI now properly saves configuration:
+- **Sources**: Saved to `%APPDATA%\WinEventEngine\config.toml`
+- **Rules**: Saved to `%APPDATA%\WinEventEngine\automations.json`
+
+**Verify configuration is saved**:
+1. Create a rule or source in the GUI
+2. Check the AppData folder exists:
+   ```
+   %APPDATA%\WinEventEngine\
+   ```
+3. Verify files are created and contain your changes
+
+**If still not working**:
+- Ensure you have write permissions to `%APPDATA%`
+- Try running the GUI as Administrator once to create the directory
+- Check if antivirus is blocking file writes
+
 ### GUI Freezes or Unresponsive
 
 **Problem**: Interface becomes unresponsive

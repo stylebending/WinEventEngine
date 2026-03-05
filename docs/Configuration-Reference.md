@@ -34,6 +34,27 @@ trigger = { type = "file_created", pattern = "*.txt" }
 action = { type = "log", message = "File created!" }
 ```
 
+## Configuration File Locations
+
+### CLI Mode
+When running from the command line, the engine looks for:
+- `config.toml` in the current working directory
+- Rules are saved to `automations.json` in the same directory
+
+### GUI Mode
+When using the native GUI, configuration is stored in:
+- **Config**: `%APPDATA%\WinEventEngine\config.toml`
+- **Rules**: `%APPDATA%\WinEventEngine\automations.json`
+
+On Windows, `%APPDATA%` typically resolves to:
+- `C:\Users\<username>\AppData\Roaming`
+
+**Note:** The GUI starts with an empty configuration by default. Sources and rules created in the GUI are automatically persisted to the AppData location.
+
+### Priority and Merging
+
+User-created rules (in `automations.json`) always take priority over rules defined in `config.toml`. If a rule with the same name exists in both locations, the user rule is used and the config rule is ignored.
+
 ## Engine Settings
 
 ```toml
