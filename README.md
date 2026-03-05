@@ -1,4 +1,4 @@
-<img width="150px" heigth="150px" src="assets/logo.png">
+<p align="center"><img width="150px" heigth="150px" src="assets/logo.png"></p>
 
 <p align="center"><img src="https://readme-typing-svg.herokuapp.com?font=Fira+Code&pause=1000&center=true&width=435&lines=WinEventEngine;Simple+Configuration;Powerful+Results" alt="WinEventEngine" /></p>
 
