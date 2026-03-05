@@ -28,6 +28,8 @@ pub struct EngineConfig {
     pub event_buffer_size: usize,
     #[serde(default)]
     pub log_level: String,
+    #[serde(default)]
+    pub http_requests_enabled: bool,
 }
 
 impl Default for EngineConfig {
@@ -35,6 +37,7 @@ impl Default for EngineConfig {
         Self {
             event_buffer_size: default_event_buffer_size(),
             log_level: "info".to_string(),
+            http_requests_enabled: false, // Security: disabled by default
         }
     }
 }

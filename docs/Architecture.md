@@ -12,6 +12,7 @@ Technical deep-dive into the WinEventEngine architecture.
 - [Rule Engine](#rule-engine)
 - [Action System](#action-system)
 - [Lua Scripting Integration](#lua-scripting-integration)
+- [GUI Architecture](#gui-architecture)
 - [Metrics & Monitoring](#metrics--monitoring)
 - [Security Model](#security-model)
 - [Performance Considerations](#performance-considerations)
@@ -49,7 +50,8 @@ WinEventEngine is built with a modular, event-driven architecture using Rust's a
 │  Supporting Systems                                     │
 │  ├─ Configuration (TOML) + Hot Reload                   │
 │  ├─ Metrics Collector (1h sliding window)               │
-│  └─ Web Dashboard (WebSocket @ 127.0.0.1:9090)          │
+│  ├─ Windows Service Integration                         │
+│  └─ Native GUI (Iced)                                   │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -166,9 +168,11 @@ pub trait Action: Send + Sync {
    - Error stream capture
 
 3. **HTTP Request** - Webhook integration
-   - GET/POST/PUT/DELETE
+   - GET/POST/PUT/DELETE/PATCH
    - Custom headers
    - Body templating with event data
+   - **Security**: Must be enabled in settings (disabled by default)
+   - **Variables**: Response available via `HTTP_STATUS_CODE`, `HTTP_RESPONSE_BODY`, `HTTP_SUCCESS`
 
 4. **Log** - Structured logging
    - Debug/Info/Warn/Error levels
@@ -265,6 +269,50 @@ pub trait Action: Send + Sync {
 - Command execution via controlled API
 - All I/O goes through Rust-implemented APIs
 
+## GUI Architecture
+
+The native GUI is built with [Iced](https://iced.rs/), a cross-platform GUI library for Rust.
+
+```
+┌─────────────────────────────────────────┐
+│           WinEventApp                   │
+│  (Main Application State)               │
+└──────────────┬──────────────────────────┘
+               │
+       ┌───────┴───────┐
+       │               │
+┌──────▼──────┐ ┌──────▼──────┐
+│   Views     │ │   State     │
+│             │ │             │
+│ - Dashboard │ │ - Engine    │
+│ - Rules     │ │ - Events    │
+│ - Sources   │ │ - Metrics   │
+│ - Tester    │ │ - Config    │
+│ - Settings  │ │ - Theme     │
+└─────────────┘ └─────────────┘
+```
+
+**GUI Features:**
+- **Dashboard**: Real-time event stream, metrics cards, status indicators
+- **Rules**: Create, edit, delete, enable/disable automation rules
+- **Sources**: Configure and manage event source plugins
+- **Event Tester**: Test rules against sample events with JSON input
+- **Settings**: Theme selection, service management, HTTP security toggle
+
+**Event Broadcasting:**
+```rust
+// Engine broadcasts events to GUI
+tokio::sync::broadcast::channel(100)
+
+// GUI subscribes and updates in real-time
+```
+
+**Update Flow:**
+1. Engine processes event
+2. Event broadcast to all subscribers
+3. GUI receives event via broadcast channel
+4. UI updates immediately (no polling)
+
 ## Metrics & Monitoring
 
 ### Metrics Collection
@@ -293,23 +341,11 @@ pub struct MetricsCollector {
 - Error metrics: 24 hours
 - Cleanup runs every 5 minutes
 
-### WebSocket Dashboard
-
-**Connection Flow:**
-```
-Browser ──HTTP──→ axum server
-   │                │
-   └──WebSocket──→ upgrade to WS
-                    │
-                    ├─ Subscribe to broadcast channel
-                    ├─ Send initial snapshot
-                    └─ Stream real-time updates
-```
-
-**Update Frequency:**
-- Events: Immediate (as they happen)
-- Snapshots: Every 5 seconds
-- Charts: Updated client-side every second
+**GUI Dashboard:**
+- Real-time metrics display
+- Event counter cards
+- Last update timestamp
+- Auto-refresh every 2 seconds
 
 ## Security Model
 
@@ -320,6 +356,24 @@ Browser ──HTTP──→ axum server
 - **File access**: Restricted API only, path validation
 - **Network**: HTTP/HTTPS only via controlled API
 
+### HTTP Request Security
+
+**Disabled by Default:**
+```toml
+[engine]
+http_requests_enabled = false  # Security: must explicitly enable
+```
+
+**Why Disabled by Default:**
+- Prevents malicious rules from calling external APIs
+- Protects against data exfiltration
+- User must consciously enable
+
+**Enabling HTTP:**
+- Via GUI: Settings → Security → "Allow HTTP Request Actions"
+- Via Config: Set `http_requests_enabled = true`
+- Requires rule rebuild to take effect
+
 ### Privilege Requirements
 
 | Component | Normal User | Administrator |
@@ -329,13 +383,13 @@ Browser ──HTTP──→ axum server
 | Process Monitor | ✗ | ✓ |
 | Registry Monitor | ✗ | ✓ |
 | Windows Service | ✗ | ✓ |
+| HTTP Requests (toggle) | ✓ | ✓ |
 
 ### Data Protection
 
-- Dashboard: Localhost-only binding (`127.0.0.1`)
-- No network exposure by default
 - Config file: User's responsibility to secure
 - Logs: May contain sensitive paths (configure log rotation)
+- HTTP responses: Stored in environment variables (session only)
 
 ## Performance Considerations
 
@@ -357,14 +411,16 @@ Browser ──HTTP──→ axum server
 
 **Typical (idle):**
 - Engine: 20-30MB
+- GUI: 50-80MB
 - Lua runtime (per script): ~1MB
 - Metrics: ~5MB (1h retention)
-- Total: ~50MB
+- Total: ~100MB
 
 **Under load:**
 - Event buffer: Configurable (default 1000 events)
 - Per-event overhead: ~500 bytes
 - Lua scripts: Freed after execution
+- GUI event history: Last 50 events
 
 ### Optimization Tips
 
@@ -391,14 +447,16 @@ Browser ──HTTP──→ axum server
 
 - **Language**: Rust (2024 edition)
 - **Async Runtime**: Tokio
-- **HTTP/WebSocket**: axum
+- **GUI Framework**: Iced
 - **Lua**: mlua (Lua 5.4)
 - **Serialization**: serde + toml
 - **Logging**: tracing
 - **Windows API**: windows-rs
+- **Build Tools**: cargo, winres (Windows resources)
 
 ## See Also
 
 - [Configuration Reference](Configuration-Reference)
+- [GUI Guide](GUI-Guide)
 - [Event Types](Event-Types)
 - [Lua Scripting API](Lua-Scripting-API)

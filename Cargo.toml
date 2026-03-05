@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["actions", "bus", "engine", "engine_core", "metrics", "rules", "tui"]
+members = ["actions", "bus", "engine", "engine_core", "gui", "metrics", "rules", "tui"]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-authors = ["Your Name"]
+authors = ["Stylebending"]
 license = "MIT"
 repository = "https://github.com/yourusername/win_event_engine"

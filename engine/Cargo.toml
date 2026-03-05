@@ -1,11 +1,15 @@
 [package]
-name = "engine"
+name = "win_event_engine"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "engine"
+name = "WinEventEngine"
 path = "src/main.rs"
+
+[lib]
+name = "win_event_engine"
+path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -23,6 +27,7 @@ windows = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsA
 windows-service = "0.8"
 lazy_static = "1.4"
 regex = "1"
+parking_lot = "0.12"
 
 engine_core = { path = "../engine_core" }
 bus = { path = "../bus" }

@@ -45,3 +45,11 @@ secrets.toml
 *.dll
 *.lib
 *.exp
+
+# Runtime data
+automations.json
+
+# Generated assets (built from source)
+assets/logo_256.png
+gui/assets/logo.ico
+gui/assets/test.res

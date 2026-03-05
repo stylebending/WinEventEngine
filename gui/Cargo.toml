@@ -1,0 +1,57 @@
+[package]
+name = "WinEventEngine"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "WinEventEngine"
+path = "src/main.rs"
+
+[build-dependencies]
+winres = "0.1"
+image = { version = "0.24", default-features = false, features = ["png"] }
+ico = "0.3"
+
+[dependencies]
+# Iced GUI framework - using wgpu for best performance
+# wgpu provides hardware acceleration for smooth real-time event handling
+iced = { version = "0.13", features = ["wgpu", "tokio", "advanced", "canvas"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Engine library
+win_event_engine = { path = "../engine" }
+engine_core = { path = "../engine_core" }
+
+# Other utilities
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+# File dialogs
+rfd = "0.14"
+
+# Image loading for window icon
+image = { version = "0.24", default-features = false, features = ["png"] }
+
+[dependencies.windows]
+version = "0.52"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_UI_Shell",
+    "Win32_System_Console",
+]
