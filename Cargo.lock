@@ -20,7 +20,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "actions"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -483,7 +483,7 @@ checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
 
 [[package]]
 name = "bus"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "engine_core",
  "tokio",
@@ -1241,7 +1241,7 @@ checksum = "66b7e2430c6dff6a955451e2cfc438f09cea1965a9d6f87f7e3b90decc014099"
 
 [[package]]
 name = "engine_core"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2843,7 +2843,7 @@ dependencies = [
 
 [[package]]
 name = "metrics"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "dashmap",
@@ -4106,7 +4106,7 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rules"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "engine_core",
  "glob",
@@ -5227,7 +5227,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tui"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -6277,7 +6277,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 
 [[package]]
 name = "wineventengine"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "actions",
  "async-trait",
@@ -6305,7 +6305,7 @@ dependencies = [
 
 [[package]]
 name = "wineventengine-gui"
-version = "0.2.1"
+version = "0.2.4"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
