@@ -7,6 +7,10 @@ edition.workspace = true
 name = "WinEventEngine"
 path = "src/main.rs"
 
+[lib]
+name = "win_event_engine"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
@@ -23,6 +27,7 @@ windows = { version = "0.52", features = ["Win32_Foundation", "Win32_UI_WindowsA
 windows-service = "0.8"
 lazy_static = "1.4"
 regex = "1"
+parking_lot = "0.12"
 
 engine_core = { path = "../engine_core" }
 bus = { path = "../bus" }

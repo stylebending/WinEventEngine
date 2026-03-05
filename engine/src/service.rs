@@ -17,6 +17,9 @@ use windows_service::{
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
 
+// Windows error codes
+const ERROR_ACCESS_DENIED: i32 = 5;
+
 const SERVICE_NAME: &str = "WinEventEngine";
 const SERVICE_DISPLAY_NAME: &str = "Windows Event Automation Engine";
 
@@ -37,7 +40,7 @@ impl ServiceManagerHandle {
             None::<&str>,
             ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
         )
-        .map_err(|e| ServiceError::OpenScManager(e.to_string()))?;
+        .map_err(|e| ServiceError::from_service_error(e, ServiceErrorType::OpenScManager))?;
         Ok(Self { manager })
     }
 
@@ -57,7 +60,7 @@ impl ServiceManagerHandle {
 
         self.manager
             .create_service(&service_info, ServiceAccess::all())
-            .map_err(|e| ServiceError::Install(e.to_string()))?;
+            .map_err(|e| ServiceError::from_service_error(e, ServiceErrorType::Install))?;
 
         info!("Service installed successfully");
         Ok(())
@@ -67,13 +70,74 @@ impl ServiceManagerHandle {
         let service = self
             .manager
             .open_service(SERVICE_NAME, ServiceAccess::DELETE)
-            .map_err(|e| ServiceError::Uninstall(e.to_string()))?;
+            .map_err(|e| ServiceError::from_service_error(e, ServiceErrorType::Uninstall))?;
 
         service
             .delete()
-            .map_err(|e| ServiceError::Uninstall(e.to_string()))?;
+            .map_err(|e| ServiceError::from_service_error(e, ServiceErrorType::Uninstall))?;
 
         info!("Service uninstalled successfully");
+        Ok(())
+    }
+
+    /// Check if the service is installed
+    pub fn is_installed(&self) -> bool {
+        // Try to open service with minimal permissions - just need to check existence
+        self.manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS).is_ok()
+    }
+
+    /// Check if the service is set to auto-start
+    pub fn is_auto_start(&self) -> Result<bool, ServiceError> {
+        let service = self
+            .manager
+            .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
+            .map_err(|e| ServiceError::Config(e.to_string()))?;
+
+        let config = service
+            .query_config()
+            .map_err(|e| ServiceError::Config(e.to_string()))?;
+
+        Ok(matches!(config.start_type, ServiceStartType::AutoStart))
+    }
+
+    /// Set the service auto-start status
+    pub fn set_auto_start(&self, auto_start: bool) -> Result<(), ServiceError> {
+        use std::ffi::OsString;
+        
+        let service = self
+            .manager
+            .open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)
+            .map_err(|e| ServiceError::Config(e.to_string()))?;
+
+        // Get current config to preserve other settings
+        let current_config = service.query_config()
+            .map_err(|e| ServiceError::Config(e.to_string()))?;
+
+        let start_type = if auto_start {
+            ServiceStartType::AutoStart
+        } else {
+            ServiceStartType::OnDemand
+        };
+
+        // Create updated service info
+        let service_info = ServiceInfo {
+            name: OsString::from(SERVICE_NAME),
+            display_name: current_config.display_name,
+            service_type: current_config.service_type,
+            start_type,
+            error_control: current_config.error_control,
+            executable_path: current_config.executable_path,
+            launch_arguments: vec!["--run-service".into()],
+            dependencies: vec![],
+            account_name: current_config.account_name,
+            account_password: None,
+        };
+
+        service
+            .change_config(&service_info)
+            .map_err(|e| ServiceError::Config(e.to_string()))?;
+
+        info!("Service auto-start status changed to: {}", auto_start);
         Ok(())
     }
 }
@@ -272,14 +336,51 @@ pub enum ServiceError {
     Config(String),
 }
 
+#[derive(Debug)]
+enum ServiceErrorType {
+    OpenScManager,
+    Install,
+    Uninstall,
+}
+
 impl std::fmt::Display for ServiceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ServiceError::OpenScManager(msg) => write!(f, "Failed to open Service Control Manager: {}", msg),
-            ServiceError::Install(msg) => write!(f, "Failed to install service: {}", msg),
-            ServiceError::Uninstall(msg) => write!(f, "Failed to uninstall service: {}", msg),
+            ServiceError::OpenScManager(msg) => write!(f, "{}", msg),
+            ServiceError::Install(msg) => write!(f, "{}", msg),
+            ServiceError::Uninstall(msg) => write!(f, "{}", msg),
             ServiceError::Start(msg) => write!(f, "Failed to start service: {}", msg),
             ServiceError::Config(msg) => write!(f, "Service configuration error: {}", msg),
+        }
+    }
+}
+
+impl ServiceError {
+    /// Create a ServiceError from a windows_service::Error, properly detecting access denied
+    fn from_service_error(e: windows_service::Error, error_type: ServiceErrorType) -> Self {
+        // Check if this is an access denied error
+        let is_access_denied = match &e {
+            windows_service::Error::Winapi(io_err) => {
+                io_err.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+            }
+            _ => false,
+        };
+
+        if is_access_denied {
+            let msg = "Administrator privileges required. Please run the application as Administrator.".to_string();
+            match error_type {
+                ServiceErrorType::OpenScManager => ServiceError::OpenScManager(msg),
+                ServiceErrorType::Install => ServiceError::Install(msg),
+                ServiceErrorType::Uninstall => ServiceError::Uninstall(msg),
+            }
+        } else {
+            // For other errors, use the error's display message
+            let msg = e.to_string();
+            match error_type {
+                ServiceErrorType::OpenScManager => ServiceError::OpenScManager(msg),
+                ServiceErrorType::Install => ServiceError::Install(msg),
+                ServiceErrorType::Uninstall => ServiceError::Uninstall(msg),
+            }
         }
     }
 }

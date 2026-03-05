@@ -12,12 +12,18 @@ Common issues and their solutions.
 
 ### Service Registration Fails
 
-**Error**: `Access denied` when running `--install`
+**Error**: `Access denied` or "Administrator privileges required" when installing service
 
-**Solution**: Run Command Prompt as Administrator:
+**Solution**: Run the GUI as Administrator:
+1. Right-click on `WinEventEngine.exe`
+2. Select "Run as administrator"
+3. Go to Settings tab
+4. Click "Install Service"
+
+Or via Command Prompt:
 ```cmd
 Run as administrator: cmd.exe
-engine.exe --install
+WinEventEngine.exe --install
 ```
 
 ## Configuration Issues
@@ -62,6 +68,54 @@ path = "C:/Data"
 # Right:
 paths = ["C:/Data"]
 ```
+
+## GUI Issues
+
+### GUI Won't Start
+
+**Problem**: Double-clicking executable does nothing
+
+**Solutions**:
+1. Check Windows Defender/antivirus isn't blocking it
+2. Try running from terminal to see error messages
+3. Verify Visual C++ Redistributable is installed
+4. Check if another instance is already running
+
+### Dashboard Shows "No events yet..."
+
+**Problem**: No events appearing in GUI
+
+**Checklist**:
+1. ✅ Engine is running (check status at top of window)
+2. ✅ Click "Start Engine" in Settings if stopped
+3. ✅ Rules are enabled
+4. ✅ Event sources are configured
+5. ✅ Trigger test events manually to verify
+
+**Debug**:
+```bash
+# Create a test file in monitored directory
+echo "test" > C:/Monitored/test.txt
+```
+
+### GUI Freezes or Unresponsive
+
+**Problem**: Interface becomes unresponsive
+
+**Solutions**:
+1. Wait for operations to complete (import/export can take time)
+2. Restart the application
+3. Check if engine process is still running
+4. Reduce number of active rules
+
+### Theme Not Applying
+
+**Problem**: Theme change doesn't take effect
+
+**Solution**: Theme changes apply immediately. If not:
+1. Try switching to a different theme first
+2. Restart the application
+3. Check graphics drivers (Iced uses GPU acceleration)
 
 ## Runtime Issues
 
@@ -123,7 +177,7 @@ print(on_event(test_event))
 **Solutions**:
 1. Check Lua scripts for memory leaks
 2. Verify action timeouts are set
-3. Monitor dashboard for accumulating events
+3. Dashboard keeps last 50 events (normal)
 4. Restart engine periodically as workaround
 
 ## Event Source Issues
@@ -144,7 +198,7 @@ print(on_event(test_event))
 # Create a test file
 echo "test" > C:/Monitored/test.txt
 
-# Check engine logs
+# Check engine logs in terminal
 ```
 
 ### Window Watcher Not Working
@@ -187,6 +241,16 @@ echo "test" > C:/Monitored/test.txt
 3. Check file permissions
 4. For PowerShell: Use `powershell.exe -Command "..."`
 
+### HTTP Request Blocked
+
+**Error**: "HTTP requests disabled" or action logs warning instead of executing
+
+**Solutions**:
+1. Enable HTTP requests in GUI: Settings → Security → "Allow HTTP Request Actions"
+2. Or enable in config: `http_requests_enabled = true`
+3. Restart engine after enabling
+4. Verify the setting persisted (check Settings tab)
+
 ### HTTP Request Fails
 
 **Error**: `HTTP 0` or timeout
@@ -195,7 +259,7 @@ echo "test" > C:/Monitored/test.txt
 1. Check URL is correct
 2. Verify network connectivity
 3. Check firewall rules
-4. Increase timeout in script
+4. Verify HTTP requests are enabled (see above)
 5. Some URLs require TLS 1.2+ (automatic in most cases)
 
 ### Script Action Timeout
@@ -208,21 +272,28 @@ echo "test" > C:/Monitored/test.txt
 3. Avoid long-running operations
 4. Use async patterns where possible
 
-## Dashboard Issues
+## Metrics & Dashboard Issues
 
-### Dashboard Won't Load
+### Metrics Showing 0
 
-See [Web Dashboard troubleshooting](Web-Dashboard#troubleshooting)
-
-### Metrics Not Showing
-
-**Problem**: Prometheus endpoint returns empty
+**Problem**: Dashboard metrics stay at 0
 
 **Solutions**:
-1. Wait a few seconds for first metrics collection
+1. Wait a few seconds for first metrics collection (2-second interval)
 2. Trigger an event to generate metrics
 3. Check engine is processing events
-4. Verify endpoint: `curl http://127.0.0.1:9090/metrics`
+4. Verify rules are matching
+
+### Event Stream Empty
+
+**Problem**: "No events yet..." message persists
+
+**Checklist**:
+1. ✅ Engine is running
+2. ✅ Event sources are configured
+3. ✅ Rules are enabled
+4. ✅ Try creating a test file manually
+5. ✅ Check if filtering is applied
 
 ## Service Issues
 
@@ -234,7 +305,7 @@ See [Web Dashboard troubleshooting](Web-Dashboard#troubleshooting)
 1. Check Windows Event Viewer
 2. Verify config file exists and is valid
 3. Check file permissions on config
-4. Try running manually first: `engine.exe -c config.toml`
+4. Try running manually first: `WinEventEngine.exe -c config.toml`
 
 ### Service Stops Unexpectedly
 
@@ -246,6 +317,38 @@ See [Web Dashboard troubleshooting](Web-Dashboard#troubleshooting)
 3. Verify all paths in config exist
 4. Test config manually before installing service
 
+### Cannot Install Service
+
+**Error**: "Administrator privileges required"
+
+**Solution**: Must run as Administrator to install Windows services
+1. Right-click WinEventEngine.exe
+2. Select "Run as administrator"
+3. Go to Settings tab
+4. Click Install Service
+
+## Import/Export Issues
+
+### Import Fails
+
+**Error**: "Failed to import rules" or validation errors
+
+**Solutions**:
+1. Check JSON file is valid (use online JSON validator)
+2. Verify rules don't have duplicate names
+3. Ensure all referenced scripts exist
+4. Check file encoding (should be UTF-8)
+
+### Export Creates Empty File
+
+**Problem**: Exported file has no content
+
+**Solutions**:
+1. Verify you have rules to export
+2. Check file permissions in destination folder
+3. Try a different location (e.g., Desktop)
+4. Ensure disk has free space
+
 ## Getting Help
 
 ### Enable Debug Logging
@@ -255,44 +358,55 @@ See [Web Dashboard troubleshooting](Web-Dashboard#troubleshooting)
 log_level = "debug"
 ```
 
+Or in GUI: Settings → (when log level config added)
+
 ### Check Logs
 
+**Console Mode:**
+Run from terminal to see logs:
+```cmd
+WinEventEngine.exe -c config.toml
+```
+
+**Service Mode:**
 Service logs go to Windows Event Viewer:
 1. Open Event Viewer
 2. Windows Logs → Application
 3. Look for "WinEventEngine" source
 
-Console logs appear in terminal where you run `engine.exe`.
-
 ### Generate Debug Info
 
 ```cmd
-engine.exe --version
-engine.exe -c config.toml --dry-run
+WinEventEngine.exe --version
+WinEventEngine.exe -c config.toml --dry-run
 ```
 
 ### Report Issues
 
 When reporting issues, include:
-1. Engine version (`engine.exe --version`)
+1. Engine version (`WinEventEngine.exe --version`)
 2. Windows version
 3. Config file (remove sensitive data)
 4. Relevant log excerpts
 5. Steps to reproduce
+6. GUI or CLI mode?
 
 ## Quick Fixes
 
 | Problem | Quick Fix |
 |---------|-----------|
 | Won't start | Run as Administrator |
-| No events | Check `enabled = true` |
+| No events | Check `enabled = true` in rules and sources |
 | Script fails | Test with simple `log` action first |
 | High CPU | Disable unused sources |
 | Service fails | Check Event Viewer logs |
-| Dashboard 404 | Verify engine is running |
+| HTTP blocked | Enable in Settings → Security |
+| GUI frozen | Restart application |
+| Import fails | Validate JSON format |
 
 ## See Also
 
 - [Configuration Reference](Configuration-Reference) - Valid config options
+- [GUI Guide](GUI-Guide) - Using the native GUI
 - [Lua Scripting API](Lua-Scripting-API) - Debugging scripts
-- [Web Dashboard](Web-Dashboard) - Dashboard-specific issues
+- [Architecture](Architecture) - Technical details

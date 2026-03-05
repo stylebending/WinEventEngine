@@ -6,9 +6,12 @@ mod service;
 #[cfg(test)]
 mod integration_tests;
 
+// Re-export commonly used items from lib for binary use
+use crate::config::*;
+
 use clap::Parser;
-use metrics::server::MetricsServer;
 use std::path::PathBuf;
+use tokio::time::{timeout, Duration};
 use tracing::{Level, debug, error, info, warn};
 use tracing_subscriber;
 
@@ -205,6 +208,69 @@ async fn main() {
         return;
     }
 
+fn create_demo_config() -> Config {
+    use std::path::PathBuf;
+
+    Config {
+        engine: EngineConfig {
+            event_buffer_size: 100,
+            log_level: "info".to_string(),
+            http_requests_enabled: false,
+        },
+        sources: vec![SourceConfig {
+            name: "test_file_watcher".to_string(),
+            source_type: SourceType::FileWatcher {
+                paths: vec![PathBuf::from(".")],
+                pattern: Some("*.txt".to_string()),
+                recursive: false,
+            },
+            enabled: true,
+        }],
+        rules: vec![RuleConfig {
+            name: "text_file_created".to_string(),
+            description: Some("Detect when text files are created".to_string()),
+            trigger: TriggerConfig::FileCreated {
+                path: None,
+                pattern: Some("*.txt".to_string()),
+            },
+            action: ActionConfig::Log {
+                message: "Text file created!".to_string(),
+                level: "info".to_string(),
+            },
+            enabled: true,
+        }],
+    }
+}
+
+fn print_status(config: &Config) {
+    println!("\nWinEventEngine Configuration Status");
+    println!("====================================\n");
+    
+    println!("Engine Settings:");
+    println!("  Event Buffer Size: {}", config.engine.event_buffer_size);
+    println!("  Log Level: {}\n", config.engine.log_level);
+    
+    println!("Event Sources ({}):", config.sources.len());
+    for source in &config.sources {
+        let status = if source.enabled { "enabled" } else { "disabled" };
+        let type_name = match &source.source_type {
+            SourceType::FileWatcher { .. } => "file_watcher",
+            SourceType::WindowWatcher { .. } => "window_watcher",
+            SourceType::ProcessMonitor { .. } => "process_monitor",
+            SourceType::RegistryMonitor { .. } => "registry_monitor",
+        };
+        println!("  - {} ({}) [{}]", source.name, type_name, status);
+    }
+    println!();
+    
+    println!("Automation Rules ({}):", config.rules.len());
+    for rule in &config.rules {
+        let status = if rule.enabled { "enabled" } else { "disabled" };
+        println!("  - {} [{}]", rule.name, status);
+    }
+    println!();
+}
+
     if cli.dry_run {
         info!("Running in dry-run mode (actions will not be executed)");
     }
@@ -224,19 +290,11 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Start metrics server and cleanup task
+    // Start cleanup task for metrics
     let metrics = engine_instance.metrics();
     metrics.start_cleanup_task().await;
-    let rule_manager = engine_instance.create_rule_manager();
-    let metrics_server = MetricsServer::with_rule_manager(metrics, 9090, rule_manager);
-    tokio::spawn(async move {
-        if let Err(e) = metrics_server.start().await {
-            error!("Metrics server error: {}", e);
-        }
-    });
-    info!("Metrics server available at http://127.0.0.1:9090");
 
-    let status = engine_instance.get_status();
+    let status = engine_instance.get_status().await;
     info!(
         "Engine running with {} plugins and {} rules",
         status.active_plugins, status.active_rules
@@ -262,7 +320,8 @@ async fn main() {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                info!("Received shutdown signal");
+                info!("Received shutdown signal (Ctrl+C)");
+                // Force immediate shutdown - don't wait for graceful completion
                 break;
             }
             _ = shutdown_rx.recv() => {
@@ -310,71 +369,24 @@ async fn main() {
     }
 
     // Shutdown
-    engine_for_shutdown.metrics().stop_cleanup_task().await;
-    engine_for_shutdown.shutdown().await;
+    info!("Starting engine shutdown...");
+    
+    // Run shutdown with timeout to ensure we don't hang
+    let shutdown_result = timeout(Duration::from_secs(3), async {
+        engine_for_shutdown.shutdown().await;
+    }).await;
+    
+    match shutdown_result {
+        Ok(()) => info!("Engine shutdown completed gracefully"),
+        Err(_) => {
+            warn!("Engine shutdown timed out, forcing exit");
+        }
+    }
+    
     info!("Engine stopped");
+    
+    // Force exit to ensure process terminates (kills any lingering threads)
+    std::process::exit(0);
 }
 
-fn print_status(config: &config::Config) {
-    println!("\n=== Engine Status ===\n");
-    println!("Event Buffer Size: {}", config.engine.event_buffer_size);
-    println!("Log Level: {}", config.engine.log_level);
-    println!();
 
-    println!("Sources ({}):", config.sources.len());
-    for source in &config.sources {
-        let status = if source.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        };
-        println!(
-            "  - {} ({:?}) [{}]",
-            source.name, source.source_type, status
-        );
-    }
-    println!();
-
-    println!("Rules ({}):", config.rules.len());
-    for rule in &config.rules {
-        let status = if rule.enabled { "enabled" } else { "disabled" };
-        println!(
-            "  - {}: {:?} -> {:?} [{}]",
-            rule.name, rule.trigger, rule.action, status
-        );
-    }
-    println!();
-}
-
-fn create_demo_config() -> config::Config {
-    use config::*;
-
-    Config {
-        engine: EngineConfig {
-            event_buffer_size: 100,
-            log_level: "info".to_string(),
-        },
-        sources: vec![SourceConfig {
-            name: "test_file_watcher".to_string(),
-            source_type: SourceType::FileWatcher {
-                paths: vec![PathBuf::from(".")],
-                pattern: Some("*.txt".to_string()),
-                recursive: false,
-            },
-            enabled: true,
-        }],
-        rules: vec![RuleConfig {
-            name: "text_file_created".to_string(),
-            description: Some("Detect when text files are created".to_string()),
-            trigger: TriggerConfig::FileCreated {
-                path: None,
-                pattern: Some("*.txt".to_string()),
-            },
-            action: ActionConfig::Log {
-                message: "Text file created!".to_string(),
-                level: "info".to_string(),
-            },
-            enabled: true,
-        }],
-    }
-}

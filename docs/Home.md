@@ -13,14 +13,14 @@ Automate everything:
 - Get Webhook (Discord/Slack/Telegram/etc) notifications for configurable events
 - Send API requests for configurable conditions/events
 - Write easy-to-learn Lua scripts to customize everything
-- Watch it all happen in real-time on the web dashboard
+- Manage everything through an intuitive native GUI
 - Much more! Simple configuration, powerful results
 
 ## Key Features
 
 - **Event Monitoring**: File system, windows, processes, and registry
 - **Rule Engine**: Pattern-based matching with Lua scripting
-- **Web Dashboard**: Real-time monitoring at `http://localhost:9090`
+- **Native GUI**: Modern interface with real-time dashboard
 - **Windows Service**: Run as background service
 - **Plugin System**: Write custom actions in Lua
 
@@ -34,11 +34,11 @@ New to WinEventEngine? This minimal example verifies everything works. You'll cr
 
 ### 1. Download
 
-Download `engine.exe` from [GitHub Releases](https://github.com/stylebending/wineventengine/releases) and save it to a folder (e.g., `C:\Tools\wineventengine\`).
+Download `WinEventEngine.exe` from [GitHub Releases](https://github.com/stylebending/wineventengine/releases) and save it to a folder (e.g., `C:\Tools\WinEventEngine\`).
 
 ### 2. Create Your First Config
 
-Create a file named `config.toml` in the same folder as `engine.exe`. This config watches the `test_folder` subdirectory for new `.txt` files and logs when they're created:
+Create a file named `config.toml` in the same folder as `WinEventEngine.exe`. This config watches the `test_folder` subdirectory for new `.txt` files and logs when they're created:
 
 ```toml
 [engine]
@@ -66,23 +66,24 @@ enabled = true
 
 ### 3. Run the Engine
 
-Open a terminal in the folder with `engine.exe`:
+Double-click `WinEventEngine.exe` to launch the GUI, or open a terminal in the folder:
 
 ```bash
-# Create a test folder (in the same folder as engine.exe)
+# Create a test folder (in the same folder as WinEventEngine.exe)
 mkdir test_folder
 
 # Start the engine
-engine.exe -c config.toml
+WinEventEngine.exe -c config.toml
 
 # The engine is now running!
 ```
 
 ### 4. View the Dashboard
 
-Open your browser and go to: **http://127.0.0.1:9090**
-
-The dashboard is now ready and waiting for events. You'll see the connection status (green dot = connected).
+The native GUI will open automatically, showing:
+- Real-time event monitoring
+- Metrics dashboard
+- Event stream with timestamps
 
 ### 5. Test It
 
@@ -94,7 +95,7 @@ echo "Hello World" > test_folder\test.txt
 
 Watch as:
 1. The engine logs: `[LUA] New text file created!`
-2. The dashboard shows the event in real-time!
+2. The GUI dashboard shows the event in real-time!
 3. The event counter increases
 
 You'll see real-time events as they happen!
@@ -111,6 +112,7 @@ Once you've verified the engine works, try **media automation**:
 4. Your media will automatically pause when you leave that window, and resume when you return
 
 ### Getting Started
+- **[GUI Guide](GUI-Guide)** - Complete guide to using the native GUI
 - **[Configuration Reference](Configuration-Reference)** - Complete configuration options and examples
 - **[Event Types](Event-Types)** - All available events and their data
 
@@ -118,7 +120,6 @@ Once you've verified the engine works, try **media automation**:
 - **[Lua Scripting API](Lua-Scripting-API)** - Write custom actions in Lua
 
 ### Monitoring & Debugging
-- **[Web Dashboard](Web-Dashboard)** - Real-time monitoring and metrics
 - **[Troubleshooting](Troubleshooting)** - Common issues and solutions
 
 ### Development
@@ -129,13 +130,20 @@ Once you've verified the engine works, try **media automation**:
 
 Run the engine in the background without keeping a terminal open. The service starts automatically on Windows startup.
 
-### Install the Service
+### Option 1: Via GUI (Recommended)
 
-Open an **Administrator terminal in the folder containing `engine.exe`**:
+1. Open WinEventEngine GUI
+2. Go to **Settings** tab
+3. Click **Install Service** (requires Administrator privileges)
+4. Check **Start with Windows** to enable auto-start
+
+### Option 2: Via CLI
+
+Open an **Administrator terminal in the folder containing `WinEventEngine.exe`**:
 
 ```bash
 # Install the service
-engine.exe --install
+WinEventEngine.exe --install
 
 # Start the service
 sc start WinEventEngine
@@ -143,6 +151,10 @@ sc start WinEventEngine
 
 ### Manage the Service
 
+**Via GUI:**
+- Use the Settings tab to install/uninstall and toggle auto-start
+
+**Via CLI:**
 ```bash
 # Check status
 sc query WinEventEngine
@@ -151,12 +163,12 @@ sc query WinEventEngine
 sc stop WinEventEngine
 
 # Uninstall (stops and removes)
-engine.exe --uninstall
+WinEventEngine.exe --uninstall
 ```
 
 **Notes:**
-- Service starts automatically on Windows boot
-- Config file path must be absolute or relative to engine.exe location
+- Service starts automatically on Windows boot (if auto-start enabled)
+- Config file path must be absolute or relative to WinEventEngine.exe location
 - Requires Administrator privileges for install/uninstall
 
 ## Quick Reference
@@ -165,22 +177,22 @@ engine.exe --uninstall
 
 ```bash
 # View help
-engine.exe --help
+WinEventEngine.exe --help
 
 # Run with a config file
-engine.exe -c config.toml
+WinEventEngine.exe -c config.toml
 
 # Check if the engine is running
-engine.exe --status
+WinEventEngine.exe --status
 
 # Enable debug logging
-engine.exe -c config.toml --log-level debug
+WinEventEngine.exe -c config.toml --log-level debug
 
 # Dry run (see what would happen without executing)
-engine.exe -c config.toml --dry-run
+WinEventEngine.exe -c config.toml --dry-run
 
 # Install as Windows Service (requires admin terminal)
-engine.exe --install
+WinEventEngine.exe --install
 
 # Start the Service (requires admin terminal)
 sc start WinEventEngine
@@ -189,7 +201,7 @@ sc start WinEventEngine
 sc stop WinEventEngine
 
 # Uninstall as Windows Service (requires admin terminal)
-engine.exe --uninstall
+WinEventEngine.exe --uninstall
 ```
 
 ### Example Configurations
@@ -208,6 +220,20 @@ action = { type = "log", message = "Executable downloaded!", level = "warn" }
 name = "auto_backup"
 trigger = { type = "file_modified", pattern = "*.docx" }
 action = { type = "script", path = "backup.lua", function = "on_event" }
+```
+
+**HTTP Webhook (Discord):**
+```toml
+[[rules]]
+name = "discord_notification"
+trigger = { type = "file_created", pattern = "*.exe" }
+action = { 
+    type = "http_request", 
+    url = "https://discord.com/api/webhooks/YOUR_WEBHOOK",
+    method = "POST",
+    headers = { "Content-Type" = "application/json" },
+    body = '{"content": "Executable downloaded: {{EVENT_PATH}}"}'
+}
 ```
 
 See **[Configuration Reference](Configuration-Reference)** for more examples.

@@ -3,19 +3,18 @@ use crate::plugins::file_watcher::FileWatcherPlugin;
 use crate::plugins::process_monitor::ProcessMonitorPlugin;
 use crate::plugins::registry_monitor::{RegistryMonitorPlugin, RegistryRoot};
 use crate::plugins::window_watcher::WindowEventPlugin;
-use actions::{Action, ActionExecutor, ExecuteAction, LogAction, LogLevel, PowerShellAction};
+use actions::{Action, ActionExecutor, ExecuteAction, HttpRequestAction, LogAction, LogLevel, MediaKeyAction, PowerShellAction};
 use bus::create_event_bus;
 use engine_core::event::EventKind;
 use engine_core::plugin::EventSourcePlugin;
 use metrics::{
     record_event_processing_duration, record_rule_match_duration, MetricsCollector,
 };
-use metrics::server::RuleManager;
 use rules::{EventKindMatcher, FilePatternMatcher, Rule, RuleMatcher, WindowMatcher, WindowEventType};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, RwLock};
 use tokio::time::{Duration, timeout, Instant};
 use tracing::{error, info, warn};
 
@@ -33,6 +32,21 @@ pub struct Engine {
     metrics: Arc<MetricsCollector>,
     /// Tracks which source plugin types are currently running
     running_source_types: Arc<RwLock<HashSet<String>>>,
+    /// Broadcast channel for real-time event updates
+    event_broadcast_tx: tokio::sync::broadcast::Sender<engine_core::event::Event>,
+    /// Channel for requesting plugin auto-provisioning
+    plugin_request_tx: Option<mpsc::Sender<SourceConfig>>,
+    /// Auto-provisioned plugins that need to be stopped on shutdown
+    auto_provisioned_plugins: Arc<RwLock<Vec<Box<dyn EventSourcePlugin>>>>,
+    /// Task handles for graceful shutdown
+    event_processing_handle: Option<tokio::task::JoinHandle<()>>,
+    plugin_provisioning_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Worker task handles
+    worker_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Broadcast channel sender for dispatching events to workers
+    worker_tx: Option<tokio::sync::broadcast::Sender<engine_core::event::Event>>,
+    /// Number of worker tasks
+    num_workers: usize,
 }
 
 impl Engine {
@@ -63,6 +77,15 @@ impl Engine {
             }
         }
         
+        // Create broadcast channel for events (capacity 20 - drops oldest if overwhelmed)
+        // Reduced from 100 to 20 to save memory (~80% reduction in buffer memory)
+        let (event_broadcast_tx, _) = tokio::sync::broadcast::channel(20);
+        
+        // Determine worker count based on CPU cores (at least 2, at most 8)
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(2, 8))
+            .unwrap_or(4);
+        
         Self {
             config,
             config_path,
@@ -76,12 +99,32 @@ impl Engine {
             config_reload_rx: None,
             metrics,
             running_source_types: Arc::new(RwLock::new(HashSet::new())),
+            event_broadcast_tx,
+            plugin_request_tx: None,
+            auto_provisioned_plugins: Arc::new(RwLock::new(Vec::new())),
+            event_processing_handle: None,
+            plugin_provisioning_handle: None,
+            worker_handles: Vec::new(),
+            worker_tx: None,
+            num_workers,
         }
     }
     
     /// Get a reference to the metrics collector
     pub fn metrics(&self) -> Arc<MetricsCollector> {
         self.metrics.clone()
+    }
+
+    /// Subscribe to real-time event updates
+    pub fn subscribe_to_events(&self) -> tokio::sync::broadcast::Receiver<engine_core::event::Event> {
+        self.event_broadcast_tx.subscribe()
+    }
+
+    /// Set whether HTTP requests are enabled and rebuild rules
+    pub async fn set_http_requests_enabled(&mut self, enabled: bool) {
+        self.config.engine.http_requests_enabled = enabled;
+        self.rebuild_rules_and_actions().await;
+        info!("HTTP requests {}", if enabled { "enabled" } else { "disabled" });
     }
 
     pub fn take_config_reload_rx(&mut self) -> Option<mpsc::Receiver<()>> {
@@ -98,82 +141,175 @@ impl Engine {
         // Initialize plugins from configuration
         self.initialize_plugins(sender.clone()).await?;
 
-        // Build rules and actions from all rule configs (TOML + automations.json)
-        self.rebuild_rules_and_actions();
+        // Create channel for plugin auto-provisioning and spawn listener
+        let (plugin_request_tx, mut plugin_request_rx) = mpsc::channel::<SourceConfig>(16);
+        self.plugin_request_tx = Some(plugin_request_tx);
+        
+        // Spawn background task that starts plugins on demand
+        let event_sender = self.event_sender.clone();
+        let running_source_types = self.running_source_types.clone();
+        let metrics = self.metrics.clone();
+        let auto_provisioned_plugins = self.auto_provisioned_plugins.clone();
+        
+        let plugin_provisioning_handle = tokio::spawn(async move {
+            while let Some(source_config) = plugin_request_rx.recv().await {
+                let sender = match &event_sender {
+                    Some(s) => s.clone(),
+                    None => {
+                        error!("Cannot start plugin: no event sender available");
+                        continue;
+                    }
+                };
 
-        // Start event processing loop with shared state
+                let type_name = source_config.source_type.type_name().to_string();
+                info!("Auto-provisioning source plugin: {} ({})", source_config.name, type_name);
+
+                match start_plugin(&source_config, sender).await {
+                    Ok(plugin) => {
+                        info!("Auto-provisioned plugin: {}", source_config.name);
+                        running_source_types.write().await.insert(type_name.clone());
+                        // Update plugin count gauge
+                        let count = running_source_types.read().await.len();
+                        metrics.set_active_plugins(count);
+                        // Store plugin for proper shutdown (instead of leaking it)
+                        auto_provisioned_plugins.write().await.push(plugin);
+                    }
+                    Err(e) => {
+                        error!("Failed to auto-provision plugin {}: {}", source_config.name, e);
+                    }
+                }
+            }
+        });
+
+        // Build rules and actions from all rule configs (TOML + automations.json)
+        // This will also auto-provision any missing source plugins
+        self.rebuild_rules_and_actions().await;
+
+        // Create worker pool for parallel event processing
+        // Use broadcast channel so all workers can receive events
+        let (worker_tx, _) = tokio::sync::broadcast::channel::<engine_core::event::Event>(self.config.engine.event_buffer_size);
+        self.worker_tx = Some(worker_tx.clone());
+        
         let rules = self.rules.clone();
         let action_executor = self.action_executor.clone();
         let metrics = self.metrics.clone();
+        let event_broadcast_tx = self.event_broadcast_tx.clone();
+        let num_workers = self.num_workers;
 
-        tokio::spawn(async move {
-            info!("Event processing loop started");
+        // Spawn worker tasks
+        let mut worker_handles = Vec::with_capacity(num_workers);
+        for worker_id in 0..num_workers {
+            let rules = rules.clone();
+            let action_executor = action_executor.clone();
+            let metrics = metrics.clone();
+            let mut worker_rx = worker_tx.subscribe();
+            
+            let handle = tokio::spawn(async move {
+                info!("Event worker {} started", worker_id);
+                
+                loop {
+                    match worker_rx.recv().await {
+                        Ok(event) => {
+                            let start_time = Instant::now();
+                            
+                            // Clone data briefly under lock, then release immediately
+                            let (rules_snapshot, executor_snapshot) = {
+                                let rules_guard = rules.read().await;
+                                let executor_guard = action_executor.read().await;
+                                (rules_guard.clone(), executor_guard.clone())
+                            };
+                            
+                            // Process event without holding any locks
+                            for (idx, rule) in rules_snapshot.iter().enumerate() {
+                                if !rule.enabled {
+                                    continue;
+                                }
+                                
+                                metrics.record_rule_evaluation_with_broadcast(&rule.name);
+                                
+                                let match_start = Instant::now();
+                                let matched = rule.matches(&event);
+                                record_rule_match_duration(&metrics, &rule.name, match_start.elapsed());
+                                
+                                if matched {
+                                    metrics.record_rule_match_with_broadcast(&rule.name);
+                                    info!("Rule '{}' matched event from {}", rule.name, event.source);
+                                    
+                                    let action_name = format!("rule_{}_action", idx);
+                                    let action_start = Instant::now();
+                                    
+                                    match executor_snapshot.execute(&action_name, &event) {
+                                        Ok(result) => {
+                                            metrics.record_action_execution_with_broadcast(
+                                                &action_name,
+                                                true,
+                                                action_start.elapsed()
+                                            );
+                                            info!("Action executed successfully: {:?}", result);
+                                        }
+                                        Err(e) => {
+                                            metrics.record_action_execution_with_broadcast(
+                                                &action_name,
+                                                false,
+                                                action_start.elapsed()
+                                            );
+                                            error!("Action execution failed: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            record_event_processing_duration(&metrics, start_time.elapsed());
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            continue;
+                        }
+                    }
+                }
+                
+                info!("Event worker {} stopped", worker_id);
+            });
+            worker_handles.push(handle);
+        }
+        self.worker_handles = worker_handles;
+
+        // Start event dispatcher - just forwards events to workers and broadcasts
+        let event_broadcast_tx = self.event_broadcast_tx.clone();
+        let metrics = self.metrics.clone();
+        let worker_tx = worker_tx.clone();
+        
+        let event_processing_handle = tokio::spawn(async move {
+            info!("Event dispatcher started with {} workers", num_workers);
 
             while let Some(event) = receiver.recv().await {
-                let start_time = Instant::now();
                 let event_source = event.source.clone();
                 let event_type = format!("{:?}", event.kind);
+
+                // Broadcast event to subscribers (GUI, etc.) - ignore errors if no subscribers
+                let _ = event_broadcast_tx.send(event.clone());
 
                 // Record event received with broadcast
                 metrics.record_event_with_broadcast(&event_source, &event_type);
 
-                tracing::debug!("Processing event: {:?} from {}", event.kind, event.source);
-
-                // Read current rules snapshot (allows hot-reload)
-                let current_rules = rules.read().unwrap().clone();
-                let current_executor = action_executor.read().unwrap().clone();
-
-                for (idx, rule) in current_rules.iter().enumerate() {
-                    if !rule.enabled {
-                        continue;
-                    }
-
-                    // Record rule evaluation with broadcast
-                    metrics.record_rule_evaluation_with_broadcast(&rule.name);
-
-                    let match_start = Instant::now();
-                    let matched = rule.matches(&event);
-                    record_rule_match_duration(&metrics, &rule.name, match_start.elapsed());
-
-                    if matched {
-                        // Record successful rule match with broadcast
-                        metrics.record_rule_match_with_broadcast(&rule.name);
-                        info!("Rule '{}' matched event from {}", rule.name, event.source);
-
-                        let action_name = format!("rule_{}_action", idx);
-                        let action_start = Instant::now();
-
-                        match current_executor.execute(&action_name, &event) {
-                            Ok(result) => {
-                                metrics.record_action_execution_with_broadcast(
-                                    &action_name,
-                                    true,
-                                    action_start.elapsed()
-                                );
-                                info!("Action executed successfully: {:?}", result);
-                            }
-                            Err(e) => {
-                                metrics.record_action_execution_with_broadcast(
-                                    &action_name,
-                                    false,
-                                    action_start.elapsed()
-                                );
-                                error!("Action execution failed: {}", e);
-                            }
-                        }
-                    }
-                }
-
-                // Record total event processing duration
-                record_event_processing_duration(&metrics, start_time.elapsed());
+                tracing::debug!("Dispatching event: {:?} from {}", event.kind, event.source);
+                
+                // Dispatch to workers via broadcast channel (non-blocking)
+                let _ = worker_tx.send(event);
             }
 
-            info!("Event processing loop stopped");
+            info!("Event dispatcher stopped");
         });
 
         // Set engine status gauges for dashboard
-        let status = self.get_status();
+        let status = self.get_status().await;
         self.metrics.set_engine_status(status.active_plugins, status.active_rules);
+
+        // Store task handles for graceful shutdown
+        self.event_processing_handle = Some(event_processing_handle);
+        self.plugin_provisioning_handle = Some(plugin_provisioning_handle);
 
         info!("Engine initialized successfully");
         Ok(())
@@ -183,17 +319,23 @@ impl Engine {
         &mut self,
         sender: mpsc::Sender<engine_core::event::Event>,
     ) -> Result<(), EngineError> {
-        let mut running = self.running_source_types.write().unwrap();
-        for source_config in &self.config.sources {
-            if !source_config.enabled {
-                info!("Skipping disabled source: {}", source_config.name);
-                continue;
-            }
+        // Collect enabled sources first to avoid holding lock across await
+        let enabled_sources: Vec<_> = self.config.sources
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect();
+        
+        for source_config in enabled_sources {
+            info!("Initializing plugin: {}", source_config.name);
 
-            match self.create_plugin(source_config, sender.clone()).await {
+            match self.create_plugin(&source_config, sender.clone()).await {
                 Ok(plugin) => {
                     info!("Initialized plugin: {}", source_config.name);
+                    // Update tracking - hold lock only for the brief update
+                    let mut running = self.running_source_types.write().await;
                     running.insert(source_config.source_type.type_name().to_string());
+                    drop(running);
                     self.plugins.push(plugin);
                 }
                 Err(e) => {
@@ -201,7 +343,6 @@ impl Engine {
                 }
             }
         }
-        drop(running);
 
         Ok(())
     }
@@ -310,12 +451,20 @@ impl Engine {
 
     /// Rebuild rules and actions from current rule_configs.
     /// This is called on initialization and when rules are modified via the dashboard.
-    fn rebuild_rules_and_actions(&self) {
-        let configs = self.rule_configs.read().unwrap();
+    async fn rebuild_rules_and_actions(&self) {
+        let configs = self.rule_configs.read().await;
         let mut new_rules = Vec::new();
         let mut new_executor = ActionExecutor::new();
+        let mut needed_source_types: HashSet<String> = HashSet::new();
 
         for (idx, rule_config) in configs.iter().enumerate() {
+            // Track which source plugins are needed for enabled rules
+            if rule_config.enabled {
+                if let Some(source_type) = rule_config.trigger.required_source_type() {
+                    needed_source_types.insert(source_type.to_string());
+                }
+            }
+
             match create_rule(rule_config) {
                 Ok(rule) => {
                     info!("Loaded rule: {}", rule.name);
@@ -327,35 +476,101 @@ impl Engine {
             }
 
             let action_name = format!("rule_{}_action", idx);
-            let action = create_action(&rule_config.action);
+            let action = create_action(&rule_config.action, self.config.engine.http_requests_enabled);
             new_executor.register(action_name, action);
         }
 
         let rule_count = new_rules.len();
 
         // Write to shared state so the event processing loop picks up changes
-        *self.rules.write().unwrap() = new_rules;
-        *self.action_executor.write().unwrap() = new_executor;
+        *self.rules.write().await = new_rules;
+        *self.action_executor.write().await = new_executor;
+
+        // Auto-provision missing source plugins
+        if let Some(ref plugin_tx) = self.plugin_request_tx {
+            let running = self.running_source_types.read().await;
+            for source_type in &needed_source_types {
+                if !running.contains(source_type) {
+                    // Find a rule config that needs this source type to build a default config
+                    let trigger = configs.iter()
+                        .find(|r| r.enabled && r.trigger.required_source_type() == Some(source_type.as_str()))
+                        .map(|r| &r.trigger);
+
+                    if let Some(trigger) = trigger {
+                        if let Some(source_config) = default_source_config(source_type, trigger) {
+                            info!("Requesting auto-provision of source plugin: {}", source_type);
+                            if let Err(e) = plugin_tx.try_send(source_config) {
+                                error!("Failed to request plugin auto-provision: {}", e);
+                            }
+                        } else {
+                            warn!(
+                                "Cannot auto-provision '{}' plugin - requires manual configuration in config.toml",
+                                source_type
+                            );
+                        }
+                    }
+                }
+            }
+            drop(running);
+        }
 
         info!("Rules rebuilt: {} active rules", rule_count);
     }
 
     pub async fn shutdown(&mut self) {
         info!("Shutting down engine");
-
+        
+        // 1. Signal shutdown to all tasks
+        self.shutdown_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        
+        // 2. Drop channels to stop workers and dispatcher first (immediate)
+        self.worker_tx = None;
+        self.plugin_request_tx = None;
+        self.event_sender = None;
+        
+        // 3. Abort all task handles immediately (don't wait for graceful completion)
+        if let Some(handle) = self.event_processing_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.plugin_provisioning_handle.take() {
+            handle.abort();
+        }
+        for handle in self.worker_handles.drain(..) {
+            handle.abort();
+        }
+        
+        // 4. Stop explicitly managed plugins with timeout
         for plugin in &mut self.plugins {
-            if let Err(e) = plugin.stop().await {
-                error!("Error stopping plugin: {}", e);
+            let stop_result = timeout(Duration::from_millis(500), plugin.stop()).await;
+            match stop_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Error stopping plugin: {}", e),
+                Err(_) => warn!("Plugin stop timed out"),
             }
         }
-
+        
+        // 5. Stop auto-provisioned plugins with timeout
+        let mut auto_plugins = self.auto_provisioned_plugins.write().await;
+        for plugin in auto_plugins.iter_mut() {
+            let stop_result = timeout(Duration::from_millis(500), plugin.stop()).await;
+            match stop_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => error!("Error stopping auto-provisioned plugin: {}", e),
+                Err(_) => warn!("Auto-provisioned plugin stop timed out"),
+            }
+        }
+        auto_plugins.clear();
+        
+        // 6. Stop metrics cleanup
+        let _ = timeout(Duration::from_millis(500), self.metrics.stop_cleanup_task()).await;
+        
         info!("Engine shutdown complete");
     }
 
-    pub fn get_status(&self) -> EngineStatus {
+    pub async fn get_status(&self) -> EngineStatus {
         EngineStatus {
             active_plugins: self.plugins.len(),
-            active_rules: self.rules.read().unwrap().len(),
+            active_rules: self.rules.read().await.len(),
         }
     }
 
@@ -367,7 +582,7 @@ impl Engine {
                 "New configuration validation failed: {}, keeping current config",
                 e
             );
-            let status = self.get_status();
+            let status = self.get_status().await;
             self.metrics.record_config_reload_with_broadcast(false, status.active_plugins, status.active_rules);
             return Err(EngineError::Config(e.to_string()));
         }
@@ -379,13 +594,13 @@ impl Engine {
             }
         }
         self.plugins.clear();
-        self.running_source_types.write().unwrap().clear();
+        self.running_source_types.write().await.clear();
 
         self.config = new_config;
 
         // Update rule_configs from new config (preserving automations.json rules)
         {
-            let mut configs = self.rule_configs.write().unwrap();
+            let mut configs = self.rule_configs.write().await;
             *configs = self.config.rules.clone();
             // Re-merge automations from file if it exists
             if let Some(ref automations_path) = self.automations_path {
@@ -410,9 +625,9 @@ impl Engine {
 
         // Rebuild rules and actions — the existing event processing loop
         // reads from the shared Arc<RwLock<>> and will pick these up automatically
-        self.rebuild_rules_and_actions();
+        self.rebuild_rules_and_actions().await;
 
-        let status = self.get_status();
+        let status = self.get_status().await;
         self.metrics.record_config_reload_with_broadcast(true, status.active_plugins, status.active_rules);
         self.metrics.set_engine_status(status.active_plugins, status.active_rules);
         info!(
@@ -514,46 +729,14 @@ impl Engine {
         self.rule_configs.clone()
     }
 
-    /// Creates a rule manager for the web dashboard and spawns a background task
-    /// that auto-starts source plugins when rules require them.
+    /// Creates a rule manager for the GUI that shares the engine's plugin request channel.
+    /// The background task for auto-provisioning is already spawned in Engine::initialize().
     pub fn create_rule_manager(&self) -> EngineRuleManager {
-        let (plugin_request_tx, mut plugin_request_rx) = mpsc::channel::<SourceConfig>(16);
-
-        // Spawn background task that starts plugins on demand
-        let event_sender = self.event_sender.clone();
-        let running_source_types = self.running_source_types.clone();
-        let metrics = self.metrics.clone();
-
-        tokio::spawn(async move {
-            while let Some(source_config) = plugin_request_rx.recv().await {
-                let sender = match &event_sender {
-                    Some(s) => s.clone(),
-                    None => {
-                        error!("Cannot start plugin: no event sender available");
-                        continue;
-                    }
-                };
-
-                let type_name = source_config.source_type.type_name().to_string();
-                info!("Auto-provisioning source plugin: {} ({})", source_config.name, type_name);
-
-                match start_plugin(&source_config, sender).await {
-                    Ok(plugin) => {
-                        info!("Auto-provisioned plugin: {}", source_config.name);
-                        running_source_types.write().unwrap().insert(type_name);
-                        // Update plugin count gauge
-                        let count = running_source_types.read().unwrap().len();
-                        metrics.set_active_plugins(count);
-                        // Keep plugin alive by leaking it into a spawned task
-                        // (the plugin runs its own internal loop via tokio::spawn)
-                        std::mem::forget(plugin);
-                    }
-                    Err(e) => {
-                        error!("Failed to auto-provision plugin {}: {}", source_config.name, e);
-                    }
-                }
-            }
-        });
+        // Use the existing plugin request channel from Engine::initialize()
+        // If not initialized yet (plugin_request_tx is None), create a temporary channel
+        // This shouldn't happen in normal operation since initialize() is called before create_rule_manager()
+        let plugin_request_tx = self.plugin_request_tx.clone()
+            .expect("Engine must be initialized before creating rule manager");
 
         EngineRuleManager {
             rule_configs: self.rule_configs.clone(),
@@ -563,6 +746,7 @@ impl Engine {
             automations_path: self.automations_path.clone(),
             running_source_types: self.running_source_types.clone(),
             plugin_request_tx,
+            http_requests_enabled: self.config.engine.http_requests_enabled,
         }
     }
 }
@@ -801,7 +985,7 @@ fn create_rule(config: &RuleConfig) -> Result<Rule, EngineError> {
 
 /// Create an Action from an ActionConfig.
 /// Standalone function so both Engine and EngineRuleManager can use it.
-fn create_action(action_config: &ActionConfig) -> Box<dyn Action> {
+fn create_action(action_config: &ActionConfig, http_requests_enabled: bool) -> Box<dyn Action> {
     match action_config {
         ActionConfig::Execute {
             command,
@@ -838,40 +1022,32 @@ fn create_action(action_config: &ActionConfig) -> Box<dyn Action> {
             // For now, use log action as a placeholder for notifications
             Box::new(LogAction::new(format!("{}: {}", title, message)))
         }
-        ActionConfig::HttpRequest { url, .. } => {
-            // HTTP requests would need additional implementation
-            Box::new(LogAction::new(format!("HTTP request to: {}", url)))
+        ActionConfig::HttpRequest { url, method, headers, body } => {
+            // Security check: HTTP requests must be explicitly enabled
+            if !http_requests_enabled {
+                warn!("HTTP request blocked: http_requests_enabled is false in engine config");
+                return Box::new(LogAction::new(
+                    format!("HTTP request to {} blocked - enable http_requests_enabled in settings", url)
+                ));
+            }
+            
+            // Create HTTP request action with all parameters
+            let mut action = HttpRequestAction::new(url)
+                .with_method(method.clone());
+            
+            if !headers.is_empty() {
+                action = action.with_headers(headers.clone());
+            }
+            
+            if let Some(body_content) = body {
+                action = action.with_body(body_content.clone());
+            }
+            
+            Box::new(action)
         }
         ActionConfig::Media { command } => {
-            let vk_code = match command.as_str() {
-                "play_pause" | "play" | "pause" | "toggle" => "0xB3", // VK_MEDIA_PLAY_PAUSE
-                "next" => "0xB0",                       // VK_MEDIA_NEXT_TRACK
-                "previous" => "0xB1",                   // VK_MEDIA_PREV_TRACK
-                "stop" => "0xB2",                       // VK_MEDIA_STOP
-                "volume_up" => "0xAF",                  // VK_VOLUME_UP
-                "volume_down" => "0xAE",                // VK_VOLUME_DOWN
-                "mute" => "0xAD",                       // VK_VOLUME_MUTE
-                _ => "0xB3",                            // Default to play/pause
-            };
-            let script = format!(
-                r#"
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class MediaKeys {{
-    [DllImport("user32.dll", CharSet = CharSet.Auto, CallingConvention = CallingConvention.StdCall)]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-    public static void SendKey(byte vk) {{
-        keybd_event(vk, 0, 0, UIntPtr.Zero);
-        keybd_event(vk, 0, 2, UIntPtr.Zero);
-    }}
-}}
-"@
-[MediaKeys]::SendKey({})
-"#,
-                vk_code
-            );
-            Box::new(PowerShellAction::new(&script))
+            // Use direct Windows API for instant media key execution
+            Box::new(MediaKeyAction::new(command))
         }
         ActionConfig::Script {
             path,
@@ -915,6 +1091,56 @@ public class MediaKeys {{
     }
 }
 
+impl Engine {
+    /// Install the engine as a Windows service
+    pub fn install_service(&self) -> Result<(), crate::service::ServiceError> {
+        use crate::service::ServiceManagerHandle;
+        
+        let manager = ServiceManagerHandle::new()?;
+        let exe_path = std::env::current_exe()
+            .map_err(|e| crate::service::ServiceError::Config(format!("Failed to get executable path: {}", e)))?;
+        let exe_path_str = exe_path.to_string_lossy().to_string();
+        
+        manager.install(&exe_path_str)
+    }
+
+    /// Uninstall the engine Windows service
+    pub fn uninstall_service(&self) -> Result<(), crate::service::ServiceError> {
+        use crate::service::ServiceManagerHandle;
+        
+        let manager = ServiceManagerHandle::new()?;
+        manager.uninstall()
+    }
+
+    /// Check if the service is installed
+    pub fn is_service_installed(&self) -> bool {
+        use crate::service::ServiceManagerHandle;
+        
+        match ServiceManagerHandle::new() {
+            Ok(manager) => manager.is_installed(),
+            Err(_) => false,
+        }
+    }
+
+    /// Check if the service is set to auto-start
+    pub fn is_service_auto_start(&self) -> bool {
+        use crate::service::ServiceManagerHandle;
+        
+        match ServiceManagerHandle::new() {
+            Ok(manager) => manager.is_auto_start().unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
+    /// Set the service auto-start status
+    pub fn set_service_auto_start(&self, auto_start: bool) -> Result<(), crate::service::ServiceError> {
+        use crate::service::ServiceManagerHandle;
+        
+        let manager = ServiceManagerHandle::new()?;
+        manager.set_auto_start(auto_start)
+    }
+}
+
 pub struct EngineRuleManager {
     rule_configs: Arc<RwLock<Vec<RuleConfig>>>,
     rules: Arc<RwLock<Vec<Rule>>>,
@@ -923,12 +1149,13 @@ pub struct EngineRuleManager {
     automations_path: Option<PathBuf>,
     running_source_types: Arc<RwLock<HashSet<String>>>,
     plugin_request_tx: mpsc::Sender<SourceConfig>,
+    http_requests_enabled: bool,
 }
 
 impl EngineRuleManager {
-    fn save_to_file(&self) {
+    pub async fn save_to_file(&self) {
         if let Some(ref path) = self.automations_path {
-            let configs = self.rule_configs.read().unwrap();
+            let configs = self.rule_configs.read().await;
             match serde_json::to_string_pretty(&*configs) {
                 Ok(json) => {
                     if let Err(e) = std::fs::write(path, json) {
@@ -947,8 +1174,8 @@ impl EngineRuleManager {
     /// Rebuild the active rules and actions from the current rule_configs.
     /// Called after any CRUD operation to make changes take effect immediately.
     /// Also auto-provisions any source plugins required by the rules.
-    fn rebuild_active_rules(&self) {
-        let configs = self.rule_configs.read().unwrap();
+    async fn rebuild_active_rules(&self) {
+        let configs = self.rule_configs.read().await;
         let mut new_rules = Vec::new();
         let mut new_executor = ActionExecutor::new();
         let mut needed_source_types: HashSet<String> = HashSet::new();
@@ -965,7 +1192,7 @@ impl EngineRuleManager {
             }
 
             let action_name = format!("rule_{}_action", idx);
-            let action = create_action(&rule_config.action);
+            let action = create_action(&rule_config.action, self.http_requests_enabled);
             new_executor.register(action_name, action);
 
             // Track which source plugin types are needed
@@ -978,14 +1205,14 @@ impl EngineRuleManager {
 
         let rule_count = new_rules.len();
 
-        *self.rules.write().unwrap() = new_rules;
-        *self.action_executor.write().unwrap() = new_executor;
+        *self.rules.write().await = new_rules;
+        *self.action_executor.write().await = new_executor;
 
         // Only update the rules gauge — don't touch active_plugins
         self.metrics.set_active_rules(rule_count);
 
         // Auto-provision missing source plugins
-        let running = self.running_source_types.read().unwrap();
+        let running = self.running_source_types.read().await;
         for source_type in &needed_source_types {
             if !running.contains(source_type) {
                 // Find a rule config that needs this source type to build a default config
@@ -1014,16 +1241,16 @@ impl EngineRuleManager {
     }
 }
 
-impl RuleManager for EngineRuleManager {
-    fn get_rules(&self) -> Vec<serde_json::Value> {
-        let configs = self.rule_configs.read().unwrap();
+impl EngineRuleManager {
+    pub async fn get_rules(&self) -> Vec<serde_json::Value> {
+        let configs = self.rule_configs.read().await;
         configs
             .iter()
             .filter_map(|r| serde_json::to_value(r).ok())
             .collect()
     }
 
-    fn add_rule(&self, rule: serde_json::Value) -> Result<serde_json::Value, String> {
+    pub async fn add_rule(&self, rule: serde_json::Value) -> Result<serde_json::Value, String> {
         let rule_config: RuleConfig = serde_json::from_value(rule)
             .map_err(|e| format!("Invalid rule format: {}", e))?;
 
@@ -1031,7 +1258,7 @@ impl RuleManager for EngineRuleManager {
             return Err("Rule name cannot be empty".to_string());
         }
 
-        let mut configs = self.rule_configs.write().unwrap();
+        let mut configs = self.rule_configs.write().await;
         
         if configs.iter().any(|r| r.name == rule_config.name) {
             return Err(format!("Rule '{}' already exists", rule_config.name));
@@ -1039,23 +1266,23 @@ impl RuleManager for EngineRuleManager {
 
         configs.push(rule_config.clone());
         drop(configs);
-        self.save_to_file();
-        self.rebuild_active_rules();
+        self.save_to_file().await;
+        self.rebuild_active_rules().await;
 
         Ok(serde_json::to_value(rule_config).unwrap())
     }
 
-    fn update_rule(&self, name: &str, rule: serde_json::Value) -> Result<serde_json::Value, String> {
+    pub async fn update_rule(&self, name: &str, rule: serde_json::Value) -> Result<serde_json::Value, String> {
         let rule_config: RuleConfig = serde_json::from_value(rule)
             .map_err(|e| format!("Invalid rule format: {}", e))?;
 
-        let mut configs = self.rule_configs.write().unwrap();
+        let mut configs = self.rule_configs.write().await;
         
         if let Some(existing) = configs.iter_mut().find(|r| r.name == name) {
             *existing = rule_config.clone();
             drop(configs);
-            self.save_to_file();
-            self.rebuild_active_rules();
+            self.save_to_file().await;
+            self.rebuild_active_rules().await;
             
             Ok(serde_json::to_value(rule_config).unwrap())
         } else {
@@ -1063,36 +1290,36 @@ impl RuleManager for EngineRuleManager {
         }
     }
 
-    fn delete_rule(&self, name: &str) -> Result<(), String> {
-        let mut configs = self.rule_configs.write().unwrap();
+    pub async fn delete_rule(&self, name: &str) -> Result<(), String> {
+        let mut configs = self.rule_configs.write().await;
         let initial_len = configs.len();
         configs.retain(|r| r.name != name);
         
         if configs.len() < initial_len {
             drop(configs);
-            self.save_to_file();
-            self.rebuild_active_rules();
+            self.save_to_file().await;
+            self.rebuild_active_rules().await;
             Ok(())
         } else {
             Err(format!("Rule '{}' not found", name))
         }
     }
 
-    fn enable_rule(&self, name: &str, enabled: bool) -> Result<(), String> {
-        let mut configs = self.rule_configs.write().unwrap();
+    pub async fn enable_rule(&self, name: &str, enabled: bool) -> Result<(), String> {
+        let mut configs = self.rule_configs.write().await;
         
         if let Some(rule) = configs.iter_mut().find(|r| r.name == name) {
             rule.enabled = enabled;
             drop(configs);
-            self.save_to_file();
-            self.rebuild_active_rules();
+            self.save_to_file().await;
+            self.rebuild_active_rules().await;
             Ok(())
         } else {
             Err(format!("Rule '{}' not found", name))
         }
     }
 
-    fn validate_rule(&self, rule: serde_json::Value) -> Result<(), String> {
+    pub async fn validate_rule(&self, rule: serde_json::Value) -> Result<(), String> {
         let rule_config: RuleConfig = serde_json::from_value(rule)
             .map_err(|e| format!("Invalid rule format: {}", e))?;
 
@@ -1101,9 +1328,9 @@ impl RuleManager for EngineRuleManager {
         }
 
         match &rule_config.trigger {
-            TriggerConfig::FileCreated { pattern, .. } |
-            TriggerConfig::FileModified { pattern, .. } |
-            TriggerConfig::FileDeleted { pattern, .. } => {
+            TriggerConfig::FileCreated { pattern, .. }
+            | TriggerConfig::FileModified { pattern, .. }
+            | TriggerConfig::FileDeleted { pattern, .. } => {
                 if let Some(p) = pattern {
                     glob::Pattern::new(p)
                         .map_err(|e| format!("Invalid pattern '{}': {}", p, e))?;
@@ -1134,7 +1361,7 @@ impl RuleManager for EngineRuleManager {
         Ok(())
     }
 
-    fn test_rule_match(&self, rule: serde_json::Value, event_json: &str) -> Result<bool, String> {
+    pub async fn test_rule_match(&self, rule: serde_json::Value, event_json: &str) -> Result<bool, String> {
         let rule_config: RuleConfig = serde_json::from_value(rule)
             .map_err(|e| format!("Invalid rule format: {}", e))?;
 
@@ -1147,18 +1374,18 @@ impl RuleManager for EngineRuleManager {
         Ok(rule.matches(&event))
     }
 
-    fn export_rules(&self) -> Result<String, String> {
-        let rules = self.get_rules();
+    pub async fn export_rules(&self) -> Result<String, String> {
+        let rules = self.get_rules().await;
         serde_json::to_string_pretty(&rules)
             .map_err(|e| format!("Failed to serialize rules: {}", e))
     }
 
-    fn import_rules(&self, content: &str) -> Result<usize, String> {
+    pub async fn import_rules(&self, content: &str) -> Result<usize, String> {
         let rules: Vec<RuleConfig> = serde_json::from_str(content)
             .map_err(|e| format!("Invalid rules format: {}", e))?;
 
         let mut count = 0;
-        let mut configs = self.rule_configs.write().unwrap();
+        let mut configs = self.rule_configs.write().await;
         for rule in rules {
             if !configs.iter().any(|r| r.name == rule.name) {
                 configs.push(rule);
@@ -1168,8 +1395,8 @@ impl RuleManager for EngineRuleManager {
         drop(configs);
 
         if count > 0 {
-            self.save_to_file();
-            self.rebuild_active_rules();
+            self.save_to_file().await;
+            self.rebuild_active_rules().await;
         }
 
         Ok(count)

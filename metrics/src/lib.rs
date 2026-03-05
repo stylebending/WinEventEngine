@@ -1,5 +1,3 @@
-pub mod server;
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -567,6 +565,33 @@ impl MetricsCollector {
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
+    }
+
+    /// Get the total value for a counter metric by name, summing across all label variations
+    /// Returns the sum of all counters with the given base name
+    pub fn get_counter_total(&self, name: &str) -> u64 {
+        let mut total = 0u64;
+        for entry in self.counters.iter() {
+            let key = entry.key();
+            // Check if this counter matches the base name (either exact match or starts with name:{
+            if key == name || key.starts_with(&format!("{}:{{", name)) {
+                total += entry.value().load(Ordering::Relaxed);
+            }
+        }
+        total
+    }
+
+    /// Get the current value for a gauge metric by name
+    /// If multiple gauges exist with the same base name, returns the first one found
+    pub fn get_gauge_value(&self, name: &str) -> Option<f64> {
+        for entry in self.gauges.iter() {
+            let key = entry.key();
+            // Check if this gauge matches the base name
+            if key == name || key.starts_with(&format!("{}:{{", name)) {
+                return Some(f64::from_bits(entry.value().load(Ordering::Relaxed)));
+            }
+        }
+        None
     }
 
     /// Subscribe to real-time metric updates

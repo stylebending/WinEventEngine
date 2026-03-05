@@ -10,11 +10,11 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent};
-use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, GetWindowThreadProcessId};
-use windows::Win32::UI::WindowsAndMessaging::{EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS};
+use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, GetWindowThreadProcessId, PostThreadMessageW};
+use windows::Win32::UI::WindowsAndMessaging::{EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_CREATE, EVENT_OBJECT_DESTROY, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_QUIT};
 use windows::core::PWSTR;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+    OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, GetCurrentThreadId,
 };
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,7 @@ pub struct WindowEventPlugin {
     title_filter: Option<Regex>,
     process_filter: Option<Regex>,
     hook_thread: Option<JoinHandle<()>>,
+    hook_thread_id: Option<u32>,
     event_sender: Option<Sender<WindowEvent>>,
 }
 
@@ -56,6 +57,7 @@ impl WindowEventPlugin {
             title_filter: None,
             process_filter: None,
             hook_thread: None,
+            hook_thread_id: None,
             event_sender: None,
         }
     }
@@ -332,14 +334,23 @@ impl EventSourcePlugin for WindowEventPlugin {
         let (event_sender, event_receiver) = mpsc::channel::<WindowEvent>();
         self.event_sender = Some(event_sender.clone());
 
+        // Create channel to receive thread ID from spawned thread
+        let (thread_id_tx, thread_id_rx) = mpsc::channel::<u32>();
+
         // Spawn dedicated thread for Windows message loop
         let is_running_clone = is_running.clone();
         let hook_thread = thread::spawn(move || {
+            // Send thread ID back to main thread
+            let thread_id = unsafe { GetCurrentThreadId() };
+            let _ = thread_id_tx.send(thread_id);
+            
             if let Err(e) = Self::run_message_loop(event_sender, is_running_clone) {
                 error!("Window event hook thread failed: {}", e);
             }
         });
-
+        
+        // Receive thread ID (with timeout to avoid blocking if thread fails immediately)
+        self.hook_thread_id = thread_id_rx.recv_timeout(Duration::from_secs(1)).ok();
         self.hook_thread = Some(hook_thread);
 
         // Give the hook a moment to register
@@ -482,10 +493,19 @@ impl EventSourcePlugin for WindowEventPlugin {
         // Signal sender to drop (which will cause thread to exit)
         self.event_sender = None;
         
-        // Wait for thread to finish
+        // Post WM_QUIT to wake up the message loop thread
+        if let Some(thread_id) = self.hook_thread_id {
+            unsafe {
+                let _ = PostThreadMessageW(thread_id, WM_QUIT, None, None);
+            }
+        }
+        
+        // Wait for thread to finish (with timeout to avoid hanging)
         if let Some(thread) = self.hook_thread.take() {
             let _ = thread.join();
         }
+        
+        self.hook_thread_id = None;
         
         Ok(())
     }
