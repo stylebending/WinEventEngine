@@ -8,11 +8,7 @@
 
 <h3 align="center">Quick Navigation</h3>
 
-<p align="center"><a href="https://github.com/stylebending/WinEventEngine/wiki"><img src="https://img.shields.io/badge/📖-Documentation%20Wiki-darkblue?style=for-the-badge&labelColor=darkblue"></a> <a href="https://github.com/stylebending/WinEventEngine/wiki#first-time-setup-5-minutes"><img src="https://img.shields.io/badge/🚀-First%20Time%20Setup-darkblue?style=for-the-badge&labelColor=darkblue"></a> <a href="https://github.com/stylebending/WinEventEngine/wiki#next-steps"><img src="https://img.shields.io/badge/🧭-Next%20Steps-darkblue?style=for-the-badge&labelColor=darkblue"></a></p>
-
-<p align="center"><a href="https://github.com/stylebending/WinEventEngine/wiki/Configuration-Reference"><img src="https://img.shields.io/badge/⚙️-Configuration-darkblue?style=for-the-badge&labelColor=darkblue"></a> <a href="https://github.com/stylebending/WinEventEngine/wiki/Lua-Scripting-API"><img src="https://img.shields.io/badge/🔧-Lua%20Scripting-darkblue?style=for-the-badge&labelColor=darkblue"></a> <a href="https://github.com/stylebending/WinEventEngine/wiki#common-commands"><img src="https://img.shields.io/badge/💻-Commands-darkblue?style=for-the-badge&labelColor=darkblue"></a></p>
-
-<p align="center"><a href="https://github.com/stylebending/WinEventEngine/wiki#running-as-a-windows-service"><img src="https://img.shields.io/badge/🪟-Windows%20Service-darkblue?style=for-the-badge&labelColor=darkblue"></a> <a href="https://github.com/stylebending/WinEventEngine/wiki/GUI-Guide"><img src="https://img.shields.io/badge/🖥️-GUI%20Guide-darkblue?style=for-the-badge&labelColor=darkblue"></a></p>
+<p align="center"><a href="#quick-start"><img src="https://img.shields.io/badge/🚀-Quick%20Start-darkblue?style=for-the-badge&labelColor=darkblue"></a> <a href="https://github.com/stylebending/WinEventEngine/wiki"><img src="https://img.shields.io/badge/📖-Documentation%20Wiki-darkblue?style=for-the-badge&labelColor=darkblue"></a></p>
 
 <p align="center"><a href="https://github.com/stylebending/WinEventEngine/blob/main/LICENSE"><img src="https://img.shields.io/badge/📄-MIT%20License-darkblue?style=for-the-badge&labelColor=darkblue"></a> <a href="https://github.com/stylebending/WinEventEngine/blob/main/CONTRIBUTING.md"><img src="https://img.shields.io/badge/🪽-Contributing-darkblue?style=for-the-badge&labelColor=darkblue"></a></p>
 
@@ -30,18 +26,18 @@ WinEventEngine is an event-driven automation framework for Windows with a native
 - Manage everything through an intuitive native GUI
 - Much more! Simple configuration, powerful results
 
-## ✨ Key Features
+## Key Features
 
-- ** Native GUI**: Built with Iced for a modern, responsive interface
-- ** Real-time Dashboard**: Monitor events, matches, and actions live
-- ** Event Monitoring**: File system, windows, processes, and registry
-- ** Rule Engine**: Pattern-based matching with Lua scripting
-- ** Windows Service**: Run as background service
-- ** Plugin System**: Write custom actions in Lua
-- ** Multiple Themes**: Dark, Light, and System theme support
-- ** Security**: Optional HTTP request controls, admin-only service operations
+- **Native GUI**: Built with Iced for a modern, responsive interface
+- **Real-time Dashboard**: Monitor events, matches, and actions live
+- **Event Monitoring**: File system, windows, processes, and registry
+- **Rule Engine**: Pattern-based matching with Lua scripting
+- **Windows Service**: Run as background service
+- **Plugin System**: Write custom actions in Lua
+- **Multiple Themes**: Dark, Light, and System theme support
+- **Security**: Optional HTTP request controls, admin-only service operations
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Download & Run
 
