@@ -16,7 +16,7 @@
 
 ## 📦 What is WinEventEngine?
 
-WinEventEngine is an event-driven automation framework for Windows with a native GUI:
+WinEventEngine is an event-driven automation framework for Windows with a GUI:
 - Play/pause media when focusing specific windows
 - Auto commit changes to your config/dot files/folders
 - Auto build/test an application under configurable conditions
